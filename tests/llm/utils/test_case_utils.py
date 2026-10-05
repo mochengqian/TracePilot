@@ -1,0 +1,699 @@
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, List, Literal, Optional, TypeVar, Union, cast
+
+import pytest
+import yaml
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from typing_extensions import Dict
+
+from holmes.config import Config
+from holmes.core.llm import DefaultLLM
+from holmes.core.models import FrontendToolDefinition, FrontendToolMode
+from holmes.core.prompt import append_file_to_user_prompt
+from holmes.core.resource_instruction import ResourceInstructions
+from tests.llm.utils.constants import ALLOWED_EVAL_TAGS, get_allowed_tags_list
+from tests.llm.utils.test_env_vars import (
+    CLASSIFIER_MODEL,
+    MODEL,
+    MODEL_LIST_FILE_LOCATION,
+)
+
+
+class SetupFailureError(Exception):
+    """Custom exception for setup failures with additional context."""
+
+    def __init__(
+        self,
+        message: str,
+        test_id: str,
+        command: Optional[str] = None,
+        output: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.test_id = test_id
+        self.command = command
+        self.output = output
+
+
+def _model_list_exists() -> bool:
+    if not MODEL_LIST_FILE_LOCATION:
+        return False
+    if not os.path.exists(MODEL_LIST_FILE_LOCATION):
+        logging.warning(
+            f"MODEL_LIST_FILE_LOCATION is set to '{MODEL_LIST_FILE_LOCATION}' but file does not exist. "
+            "Falling back to MODEL environment variable."
+        )
+        return False
+    return True
+
+
+def _get_models_from_model_list() -> Optional[List[str]]:
+    if not _model_list_exists():
+        return None
+    config = Config()
+    models = config.get_models_list()
+    return models or []
+
+
+def _filter_models_from_env(
+    requested_models: List[str], available_models: List[str]
+) -> List[str]:
+    missing = [m for m in requested_models if m not in available_models]
+    if missing:
+        available = ", ".join(available_models)
+        raise ValueError(
+            f"The following models from MODEL are not defined in the model list: "
+            f"{', '.join(missing)}. Available models: {available}"
+        )
+    return requested_models
+
+
+def get_models() -> List[str]:
+    """Get list of models to test from MODEL env var (supports comma-separated list)."""
+    # Strip whitespace from each model and filter out empty strings
+    models = [m.strip() for m in MODEL.split(",") if m.strip()]
+
+    model_list_models = _get_models_from_model_list()
+
+    if model_list_models:
+        models = _filter_models_from_env(models, model_list_models)
+
+    if len(models) > 1:
+        if not CLASSIFIER_MODEL:
+            raise ValueError("Multiple models require CLASSIFIER_MODEL to be set")
+
+    return models
+
+
+def read_file(file_path: Path):
+    with open(file_path, "r", encoding="utf-8") as file:
+        return file.read().strip()
+
+
+TEST_CASE_ID_PATTERN = r"^[\d+]_(?:[a-z]+_)*[a-z]+$"
+CONFIG_FILE_NAME = "test_case.yaml"
+
+
+# TODO: do we ever use this? or do we always just use float below
+class Evaluation(BaseModel):
+    expected_score: float = 1
+    type: Union[Literal["loose"], Literal["strict"]]
+
+
+class LLMEvaluations(BaseModel):
+    correctness: Union[float, Evaluation] = 1
+
+
+class Message(BaseModel):
+    message: str
+
+
+T = TypeVar("T")
+
+
+class HolmesTestCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    folder: str
+    base_id: Optional[str] = None  # Base test case ID for parameterized tests
+    mocked_date: Optional[str] = None
+    tags: Optional[list[ALLOWED_EVAL_TAGS]] = None
+    skip: Optional[bool] = None
+    skip_reason: Optional[str] = None
+    expected_output: Union[str, List[str]]  # Whether an output is expected
+    evaluation: LLMEvaluations = LLMEvaluations()
+    include_tool_calls: Optional[bool] = False  # Include tool calls in LLM evaluation
+    before_test: Optional[str] = None
+    after_test: Optional[str] = None
+    setup_timeout: Optional[int] = None  # Override default setup timeout in seconds
+    conversation_history: Optional[list[dict]] = None
+    test_env_vars: Optional[Dict[str, str]] = (
+        None  # Environment variables to set during test execution
+    )
+    description: Optional[str] = None
+    toolsets: Optional[Dict[str, Any]] = None
+    port_forwards: Optional[List[Dict[str, Any]]] = (
+        None  # Port forwarding configurations
+    )
+    toolsets_matrix: Optional[List[str]] = (
+        None  # List of toolset config filenames for matrix expansion
+    )
+    toolsets_config_name: Optional[str] = (
+        None  # Derived name of the active toolset config (auto-set during matrix expansion)
+    )
+    toolsets_config_path: Optional[str] = (
+        None  # Full path to the active toolset config file (auto-set during matrix expansion)
+    )
+    max_tokens: Optional[int] = (
+        None  # Maximum total tokens allowed; test fails if exceeded
+    )
+    enable_todo: bool = (
+        False  # Enable the TodoWrite/todos feature (disabled by default in evals)
+    )
+    # Hard assertion on SuggestSkills emission (requires the tool to be
+    # injected via `frontend_tools`):
+    # - True  → the test fails if the LLM emits zero skill suggestions
+    # - False → the test fails if the LLM emits any skill suggestions
+    # - None  → no count enforcement (legacy / unspecified)
+    # The emitted suggestions are also surfaced to the LLM judge alongside
+    # `expected_output`, so suggestion content quality is scored by the judge.
+    memories_generated: Optional[bool] = None
+    # When memories_generated=True and the first pass actually emitted
+    # suggestions, also run the same prompt a SECOND time with those
+    # suggestions rendered as SKILL.md files and injected into the
+    # SkillsToolset's search paths. The replay run checks that (a) the agent
+    # fetched the skill (proving it judged the suggestion relevant) and
+    # (b) the answer is still correct. Provides a closed-loop validation
+    # that the captured skill actually helps future investigations.
+    rerun_with_memory: Optional[bool] = False
+    # Pre-loaded skills directory (relative to the test fixture folder). When
+    # set, the path is added to the SkillsToolset's search paths BEFORE the
+    # primary pass — letting an eval simulate "the customer already has
+    # skill X saved" without going through the SuggestSkills→replay flow.
+    # Used by evals that test how the agent behaves when handed an
+    # externally-authored skill (e.g. a misleading one).
+    pre_loaded_skills_path: Optional[str] = None
+    # When set, asserts that the number of SKILL.md files written from the
+    # primary pass's captured suggestions equals this value. None disables
+    # the check.
+    expected_skill_count: Optional[int] = None
+    # Names of skills loaded in the agent's context (e.g. via
+    # pre_loaded_skills_path) that the agent must propose a CORRECTION for:
+    # each listed name must appear as some suggestion's `updates_skill`
+    # field. This is the deterministic half of testing skill updates; the
+    # corrected content itself is judged via expected_output, which the LLM
+    # judge sees together with the emitted suggestions. None disables the
+    # check.
+    expected_skill_updates: Optional[List[str]] = None
+    # Controls whether the closed-loop replay strictly requires the agent
+    # to call `fetch_skill`. True (default) is right for evals where the
+    # captured skill is supposed to short-circuit rediscovery — if the agent
+    # ignores the skill, the eval fails. When False, the replay is still
+    # scored on correctness; only the skill-load assertion is relaxed.
+    require_skill_load_on_replay: bool = True
+    # Tool names that must NOT appear in the replay's tool calls. Used by
+    # discovery-style evals to assert the captured skill actually obviated
+    # the exploration it encodes (e.g. with the index schema saved in the
+    # skill, the replay must not call elasticsearch_mappings again).
+    # None/empty disables the check.
+    replay_forbidden_tools: Optional[List[str]] = None
+
+
+class AskHolmesTestCase(HolmesTestCase, BaseModel):
+    user_prompt: Union[
+        str, List[str]
+    ]  # The user's question(s) to ask holmes - can be single string or array
+    # Optional alternative expected_output for the closed-loop replay pass
+    # (which always re-asks the exact same `user_prompt`, so primary vs
+    # replay metrics compare with-skill vs without-skill on identical
+    # input). Needed when `expected_output` includes SuggestSkills-specific
+    # criteria that can never hold on replay — the tool is not injected
+    # there. If unset, the replay is judged against `expected_output`.
+    expected_replay_output: Optional[Union[str, List[str]]] = None
+    cluster_name: Optional[str] = None
+    include_files: Optional[List[str]] = None  # matches include_files option of the CLI
+    skills: Optional[Dict[str, Any]] = None  # Optional skill catalog override
+    frontend_tools: Optional[Union[str, List[Dict[str, Any]]]] = (
+        None  # Client-defined tools injected into the LLM, mirroring the
+        # `frontend_tools` field of the /api/chat request. Either an inline
+        # list of FrontendToolDefinition dicts or a path (relative to the
+        # test folder) to a YAML file containing one. Only noop-mode tools
+        # are supported in evals (there is no client to execute pause tools).
+        # When UNSET, every eval gets the shared SuggestSkills fixture
+        # (tests/llm/fixtures/shared/skill_suggestion_tool.yaml) by default,
+        # because the Robusta UI attaches that tool to every chat request in
+        # production. Set `frontend_tools: []` to opt a test out.
+    )
+    allow_toolset_failures: Optional[bool] = (
+        False  # Allow toolsets to fail prerequisite checks (default False)
+    )
+    # Tool names that must NOT appear in the (live) run's tool calls. Asserts on
+    # Holmes's actual behavior, deterministically (no LLM grading), e.g. a
+    # negative eval proving that when the answer is already in the request,
+    # Holmes does not make an unnecessary lookup. None/empty disables the check.
+    forbidden_tools: Optional[List[str]] = None
+
+    # Internal fields for variant handling
+    variant_index: Optional[int] = None  # Which variant this instance represents
+    original_user_prompt: Optional[Union[str, List[str]]] = (
+        None  # Store original prompt(s)
+    )
+    test_type: Optional[str] = None  # The type of test to run
+
+
+class FrontendPayload(BaseModel):
+    """What a frontend client contributes to a chat request: client-defined
+    tools plus an optional system prompt snippet (mirrors the
+    `frontend_tools` / `additional_system_prompt` fields of /api/chat)."""
+
+    tools: List[FrontendToolDefinition] = []
+    additional_system_prompt: Optional[str] = None
+
+
+# Injected into every eval whose test_case.yaml does not set `frontend_tools`,
+# mirroring production where the Robusta UI sends the SuggestSkills tool with
+# every chat request. Tests opt out with `frontend_tools: []`.
+DEFAULT_FRONTEND_TOOLS_PATH = (
+    Path(__file__).parent.parent / "fixtures" / "shared" / "skill_suggestion_tool.yaml"
+)
+
+
+def load_frontend_tools(
+    test_case: "AskHolmesTestCase",
+) -> Optional[FrontendPayload]:
+    """Resolve the test case's `frontend_tools` field into a FrontendPayload.
+
+    The field is either an inline list of FrontendToolDefinition dicts or a
+    path (relative to the test folder) to a YAML file containing one under a
+    top-level `frontend_tools` key. The file form may also carry an
+    `additional_system_prompt` key with the prompt snippet the frontend
+    client sends alongside its tools.
+    """
+    raw = test_case.frontend_tools
+    if raw is None:
+        # Unset -> production default: the Robusta UI sends the SuggestSkills
+        # tool with every chat request, so evals inject it unless the test
+        # explicitly opts out with `frontend_tools: []`.
+        raw = str(DEFAULT_FRONTEND_TOOLS_PATH)
+    if not raw:
+        return None
+
+    additional_system_prompt = None
+    if isinstance(raw, str):
+        tools_path = Path(test_case.folder) / raw
+        if not tools_path.exists():
+            raise FileNotFoundError(
+                f"frontend_tools file not found for test {test_case.id}: {tools_path}"
+            )
+        with open(tools_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+        if isinstance(raw, dict):
+            additional_system_prompt = raw.get("additional_system_prompt")
+            raw = raw.get("frontend_tools")
+
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"frontend_tools for test {test_case.id} must resolve to a list of "
+            f"tool definitions, got: {type(raw)}"
+        )
+
+    definitions = [FrontendToolDefinition(**tool) for tool in raw]
+    for definition in definitions:
+        if definition.mode != FrontendToolMode.NOOP:
+            raise ValueError(
+                f"frontend_tools in evals must use mode 'noop' (tool "
+                f"'{definition.name}' uses '{definition.mode.value}'): evals have "
+                "no client to execute pause-mode tools."
+            )
+    return FrontendPayload(
+        tools=definitions, additional_system_prompt=additional_system_prompt
+    )
+
+
+def check_and_skip_test(
+    test_case: HolmesTestCase, request=None, shared_test_infrastructure=None
+) -> None:
+    """Check if test should be skipped or has setup failures, and raise appropriate pytest exceptions.
+
+    Args:
+        test_case: A HolmesTestCase or any of its subclasses
+        request: The pytest request object (optional, needed for setup failure tracking)
+        shared_test_infrastructure: Shared test infrastructure dict (optional, needed for setup failure checking)
+    """
+    # Check if test should be skipped
+    if test_case.skip:
+        pytest.skip(test_case.skip_reason or "Test skipped")
+
+    # Check for setup failures FIRST - before any other skips
+    if shared_test_infrastructure is not None and request is not None:
+        setup_failures = shared_test_infrastructure.get("setup_failures", {})
+        if test_case.id in setup_failures:
+            setup_error_detail = setup_failures[test_case.id]
+            request.node.user_properties.append(("is_setup_failure", True))
+            request.node.user_properties.append(
+                ("setup_failure_detail", setup_error_detail)
+            )
+
+            # Just pass the full error detail through - no parsing needed
+            raise SetupFailureError(
+                message=setup_error_detail,
+                test_id=test_case.id,
+                command="Setup script",
+                output=setup_error_detail,  # Full details including stdout/stderr
+            )
+
+    # Check if --only-setup is set (AFTER checking for setup failures)
+    if request and request.config.getoption("--only-setup", False):
+        print("   ⚙️  --only-setup mode: Skipping test execution, only ran setup")
+        pytest.skip("Skipping test execution due to --only-setup flag")
+
+    # Check if --only-cleanup is set
+    if request and request.config.getoption("--only-cleanup", False):
+        print(
+            "   ⚙️  --only-cleanup mode: Skipping test execution, only running cleanup"
+        )
+        pytest.skip("Skipping test execution due to --only-cleanup flag")
+
+    # Check for setup failures - early return if no infrastructure or request
+    if shared_test_infrastructure is None or request is None:
+        return
+
+    # Check if test should be skipped due to port conflicts
+    tests_to_skip_port_conflicts = shared_test_infrastructure.get(
+        "tests_to_skip_port_conflicts", {}
+    )
+    if test_case.id in tests_to_skip_port_conflicts:
+        skip_reason = tests_to_skip_port_conflicts[test_case.id]
+        if request:
+            request.node.user_properties.append(("port_conflict_skip", True))
+            request.node.user_properties.append(("port_conflict_reason", skip_reason))
+        pytest.skip(f"Test skipped due to port conflict: {skip_reason}")
+
+
+class TestCaseLoader:
+    def __init__(self, test_cases_folder: Path) -> None:
+        super().__init__()
+        self._test_cases_folder = test_cases_folder
+
+    def load_ask_holmes_test_cases(self) -> List[AskHolmesTestCase]:
+        return cast(List[AskHolmesTestCase], self.load_test_cases())
+
+    def _add_port_forward_tag(self, test_case: HolmesTestCase) -> None:
+        """Automatically add port-forward tag if test has port forwards."""
+        if test_case and test_case.port_forwards:
+            if test_case.tags is None:
+                test_case.tags = []
+            if "port-forward" not in test_case.tags:
+                test_case.tags.append("port-forward")
+
+    @staticmethod
+    def _derive_toolset_config_name(filename: str) -> str:
+        """Derive a short name from a toolset config filename for use in test IDs.
+
+        Examples:
+            toolsets_builtin.yaml -> builtin
+            toolsets_http_datadog.yaml -> http_datadog
+            toolsets.yaml -> default
+            custom.yaml -> custom
+        """
+        name = filename
+        for ext in (".yaml", ".yml"):
+            if name.endswith(ext):
+                name = name[: -len(ext)]
+                break
+        if name.startswith("toolsets_"):
+            name = name[len("toolsets_") :]
+        elif name == "toolsets":
+            name = "default"
+        return name or "default"
+
+    def _expand_toolsets_matrix(
+        self, test_cases: List[HolmesTestCase]
+    ) -> List[HolmesTestCase]:
+        """Expand test cases that have toolsets_matrix into multiple variants.
+
+        Each entry in toolsets_matrix is a filename (e.g. toolsets_builtin.yaml)
+        that must exist in the test case folder. For each file, a variant of the
+        test case is created with toolsets_config_name and toolsets_config_path set.
+        The variant ID is appended with [config_name].
+        """
+        expanded: List[HolmesTestCase] = []
+        for tc in test_cases:
+            if not tc.toolsets_matrix:
+                expanded.append(tc)
+                continue
+
+            for config_filename in tc.toolsets_matrix:
+                config_path = os.path.join(tc.folder, config_filename)
+                if not os.path.isfile(config_path):
+                    raise FileNotFoundError(
+                        f"Toolsets matrix config file '{config_filename}' not found "
+                        f"in test case folder: {tc.folder}"
+                    )
+
+                name = self._derive_toolset_config_name(config_filename)
+
+                variant = tc.model_copy(deep=True)
+                variant.toolsets_config_name = name
+                variant.toolsets_config_path = config_path
+                variant.id = f"{tc.id}[{name}]"
+                if not variant.base_id:
+                    variant.base_id = tc.id
+
+                expanded.append(variant)
+
+        return expanded
+
+    def load_test_cases(self) -> List[HolmesTestCase]:
+        test_cases: List[HolmesTestCase] = []
+        test_cases_ids: List[str] = [
+            f
+            for f in os.listdir(self._test_cases_folder)
+            if not f.startswith(".")
+            and os.path.isdir(self._test_cases_folder.joinpath(f))
+        ]  # ignoring hidden files like Mac's .DS_Store and non-directory files
+        for test_case_id in test_cases_ids:
+            test_case_folder = self._test_cases_folder.joinpath(test_case_id)
+            logging.debug(f"Evaluating potential test case folder: {test_case_folder}")
+            try:
+                config_dict = yaml.safe_load(
+                    read_file(test_case_folder.joinpath(CONFIG_FILE_NAME))
+                )
+                config_dict["id"] = test_case_id
+                config_dict["folder"] = str(test_case_folder)
+                test_case: Optional[HolmesTestCase] = None
+
+                if config_dict.get("user_prompt"):
+                    config_dict["conversation_history"] = load_conversation_history(
+                        test_case_folder
+                    )
+                    extra_prompt = load_include_files(
+                        test_case_folder, config_dict.get("include_files", None)
+                    )
+
+                    original_user_prompt = config_dict["user_prompt"]
+
+                    # Handle array of user prompts - create multiple test case instances
+                    if isinstance(original_user_prompt, list):
+                        for i, prompt in enumerate(original_user_prompt):
+                            variant_config = config_dict.copy()
+                            variant_config["user_prompt"] = prompt + extra_prompt
+                            variant_config["variant_index"] = i
+                            variant_config["original_user_prompt"] = (
+                                original_user_prompt
+                            )
+                            variant_config["id"] = f"{test_case_id}[{i}]"
+                            variant_config["base_id"] = (
+                                test_case_id  # Store base ID for deduplication
+                            )
+                            test_case = TypeAdapter(AskHolmesTestCase).validate_python(
+                                variant_config
+                            )
+                            self._add_port_forward_tag(test_case)
+                            test_cases.append(test_case)
+                        continue  # Skip the normal append at the end
+                    else:
+                        # Single prompt case
+                        config_dict["user_prompt"] = (
+                            config_dict["user_prompt"] + extra_prompt
+                        )
+                        config_dict["original_user_prompt"] = original_user_prompt
+                        test_case = TypeAdapter(AskHolmesTestCase).validate_python(
+                            config_dict
+                        )
+
+                elif self._test_cases_folder.name == "compaction":
+                    # Compaction tests only need conversation_history and expected_output
+                    config_dict["conversation_history"] = load_conversation_history(
+                        test_case_folder
+                    )
+                    test_case = TypeAdapter(HolmesTestCase).validate_python(config_dict)
+                elif self._test_cases_folder.name == "test_holmes_checks":
+                    # Import CheckTestCase here to avoid circular imports
+                    from tests.llm.test_holmes_checks import CheckTestCase  # type: ignore
+
+                    test_case = TypeAdapter(CheckTestCase).validate_python(config_dict)
+                else:
+                    # Skip test cases that don't match any known type
+                    logging.debug(
+                        f"Skipping test case {test_case_id} - unknown test type"
+                    )
+                    continue
+
+                self._add_port_forward_tag(test_case)
+
+                logging.debug(f"Successfully loaded test case {test_case_id}")
+                test_cases.append(test_case)
+            except ValidationError as e:
+                error_msg = (
+                    f"\n❌ VALIDATION ERROR in test case: {test_case_folder.name}\n"
+                )
+                error_msg += "=" * 60 + "\n"
+
+                # Check for common issues first
+                if (
+                    not config_dict.get("user_prompt")
+                    and self._test_cases_folder.name == "test_ask_holmes"
+                ):
+                    error_msg += "Missing required field: 'user_prompt'\n"
+                    error_msg += "Note: Use 'user_prompt' instead of 'question' for ask_holmes tests\n"
+
+                if "id" in config_dict:
+                    error_msg += "⚠️  Found 'id' field in test_case.yaml - this should not be included\n"
+                    error_msg += (
+                        "   (ID is automatically derived from the directory name)\n"
+                    )
+
+                if "description" in config_dict and not config_dict.get("user_prompt"):
+                    error_msg += (
+                        "⚠️  Found 'description' but missing 'user_prompt' field\n"
+                    )
+
+                # Check for tag issues
+                problematic_tags = []
+                for error in e.errors():
+                    if error["type"] == "literal_error" and "tags" in str(error["loc"]):
+                        problematic_tags.append(error["input"])
+
+                if problematic_tags:
+                    error_msg += f"Invalid tags: {', '.join(problematic_tags)}\n"
+                    error_msg += f"Allowed tags: {get_allowed_tags_list()}\n"
+
+                # Show all validation errors
+                error_msg += "\nDetailed validation errors:\n"
+                for error in e.errors():
+                    loc = " -> ".join(str(item) for item in error["loc"])
+                    error_msg += f"  - {loc}: {error['msg']}\n"
+                    if error.get("input") is not None:
+                        error_msg += f"    Input value: {error['input']}\n"
+
+                error_msg += "=" * 60
+                print(error_msg)
+                raise e
+            except FileNotFoundError:
+                logging.debug(
+                    f"Folder {self._test_cases_folder}/{test_case_id} ignored because it is missing a {CONFIG_FILE_NAME} file."
+                )
+                continue
+        logging.debug(f"Found {len(test_cases)} in {self._test_cases_folder}")
+
+        # Expand toolsets_matrix variants (must happen after all test cases are loaded,
+        # including array prompt expansion, to produce the cross-product)
+        test_cases = self._expand_toolsets_matrix(test_cases)
+
+        return test_cases
+
+
+def load_issue_data(test_case_folder: Path) -> Optional[Dict]:
+    issue_data_mock_path = test_case_folder.joinpath(Path("issue_data.json"))
+    if issue_data_mock_path.exists():
+        return json.loads(read_file(issue_data_mock_path))
+    return None
+
+
+def load_resource_instructions(
+    test_case_folder: Path,
+) -> Optional[ResourceInstructions]:
+    resource_instructions_mock_path = test_case_folder.joinpath(
+        Path("resource_instructions.json")
+    )
+    if resource_instructions_mock_path.exists():
+        return TypeAdapter(ResourceInstructions).validate_json(
+            read_file(Path(resource_instructions_mock_path))
+        )
+    return None
+
+
+def _parse_conversation_history_md_files(
+    conversation_history_dir,
+) -> None | List[Dict[str, str]]:
+    # If no .md files are found in the directory, return None.
+    md_files = sorted(list(conversation_history_dir.glob("*.md")))
+
+    if not md_files:
+        return None
+
+    conversation_history: list[dict[str, str]] = []
+    for md_file_path in md_files:
+        # Get the filename without the .md extension (the "stem")
+        # e.g., "01_system.md" -> "01_system"
+        stem = md_file_path.stem
+
+        # The filename pattern is "<index>_<role>.md".
+        # The role is the part of the stem after the first underscore.
+        # Example: "01_system" -> role is "system"
+        # str.split("_", 1) splits the string at the first underscore.
+        # It will return a list of two strings if an underscore is present.
+        # e.g., "01_system".split("_", 1) -> ["01", "system"]
+        try:
+            _index_part, role = stem.split("_", 1)
+        except ValueError:
+            raise ValueError(
+                f"Filename '{md_file_path.name}' in '{conversation_history_dir}' "
+                f"does not conform to the expected '<index>_<role>.md' pattern."
+            )
+
+        content = md_file_path.read_text(encoding="utf-8")
+
+        conversation_history.append({"role": role, "content": content})
+    return conversation_history
+
+
+def load_conversation_history(test_case_folder: Path) -> Optional[list[dict[str, str]]]:
+    """
+    Loads conversation history from either .md files or a JSON file.
+
+    Supports two formats (checked in this order):
+    1. Directory with .md files:
+       test_case_folder/
+           conversation_history/
+               01_system.md
+               02_user.md
+               03_assistant.md
+               ...
+
+    2. Single JSON file:
+       test_case_folder/
+           conversation_history.json
+
+       Format: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, ...]
+
+    Returns:
+        List of message dicts with 'role' and 'content' keys, or None if not found.
+    """
+    conversation_history_dir = test_case_folder / "conversation_history"
+    if conversation_history_dir.is_dir():
+        conversation_history = _parse_conversation_history_md_files(
+            conversation_history_dir
+        )
+    elif test_case_folder.joinpath("conversation_history.json").exists():
+        conversation_history = json.loads(
+            read_file(test_case_folder.joinpath("conversation_history.json"))
+        )
+    else:
+        conversation_history = None
+
+    return conversation_history
+
+
+def load_include_files(
+    test_case_folder: Path, include_files: Optional[list[str]]
+) -> str:
+    extra_prompt: str = ""
+    if include_files:
+        for file_path_str in include_files:
+            file_path = Path(test_case_folder.joinpath(file_path_str))
+            extra_prompt = append_file_to_user_prompt(extra_prompt, file_path)
+
+    return extra_prompt
+
+
+def create_eval_llm(model: str, tracer=None) -> DefaultLLM:
+    if _model_list_exists():
+        config = Config()
+        return config._get_llm(model_key=model, tracer=tracer)  # type: ignore[arg-type]
+    return DefaultLLM(model, tracer=tracer)

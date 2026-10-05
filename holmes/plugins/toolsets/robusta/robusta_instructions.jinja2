@@ -1,0 +1,22 @@
+# Configuration and alerts history
+* Use fetch_configuration_changes_metadata to get historical configuration changes in a cluster or for a specific workload. By default it queries the CURRENT cluster and includes external changes (e.g., LaunchDarkly feature flags). Set include_external=false to exclude non-Kubernetes changes.
+* Multi-cluster support (also for fetch_resource_issues_metadata): set all_clusters=true to search across all clusters, or clusters=['cluster-a', 'cluster-b'] for specific ones.
+* You must ALWAYS call fetch_configuration_changes_metadata when investigating an alert — never respond without calling it. Look at configuration changes from the 4 hours before the alert started.
+* If a change seems important to the investigation, use fetch_finding_by_id with the configuration change ID to get its full details.
+* When investigating a resource (pod, deployment, or job) with no relevant information available from the live cluster, call fetch_resource_issues_metadata to retrieve its historical alert data. Start with a 4-hour window and expand to 24 hours if nothing comes up.
+* If you found a change that caused the alert, you MUST write: 'The issue was introduced by ...' with a short description of the change and its date, embedding the change's evidence id and a descriptive title in this format:
+'The issue was introduced by a change in the environment variables, on 2025-03-28 10:56:00 << { "type": "diff", "evidence_id": "8a4d1369-0e98-4ff2-b180-699d5ff286ab", "title": "Change in environment variables" } >>'
+* Embed related historical configuration changes only in the 'Conclusions and Possible Root Causes' section, and never add the same change more than once.
+
+# Resource and efficiency recommendations (KRR)
+* KRR (Kubernetes Resource Recommendations) right-sizes CPU and memory requests/limits — key to avoiding performance issues and saving cost. Use fetch_resource_recommendation for ALL KRR queries: whenever asked for optimization opportunities, cost savings, or whether a resource is over-utilized / can be optimized.
+* Two modes:
+  - **Discovery**: ranked list of top opportunities across workloads — control with limit and sort_by ('cpu_total', 'memory_total', or priority), filter by namespace, name_pattern (wildcards like '%app%'), kind, and container. E.g. "top CPU recommendations" → limit=10, sort_by='cpu_total'; "biggest memory savings in namespace X" → namespace='X', sort_by='memory_total'.
+  - **Specific lookup**: one known workload — exact name_pattern plus namespace and kind, e.g. name_pattern='nginx', namespace='prod', kind='Deployment'.
+* Multi-cluster: all_clusters=true for recommendations across ALL clusters in the account, or clusters=[...] for specific ones.
+* For requests like "non-GPU workloads only", filter out GPU-based resources with name_pattern or namespace filters.
+
+# Investigating issues
+* If provided an issue id (a.k.a. a finding), use `fetch_finding_by_id` to get more information about it. The id may appear in the prompt in the format << { "type": "issue", "id": "<the id of the issue>" } >> — do call the tool in that case to make sure you have all the information.
+* The data returned by `fetch_finding_by_id` reports the alert's current state: `firing: true` means currently FIRING, `false` means RESOLVED; `ends_at` null means still firing, a timestamp means resolved at that time (for prometheus alerts this reflects the latest state, including auto-resolution after a period of silence).
+* Always state explicitly whether the alert is currently firing or resolved (and if resolved, since when). Do not assume an alert is still firing without checking.
