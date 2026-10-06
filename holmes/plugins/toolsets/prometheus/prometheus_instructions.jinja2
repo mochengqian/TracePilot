@@ -1,0 +1,43 @@
+
+# Prometheus/PromQL queries
+
+{%- if config and config.prometheus_url and "coralogix" in config.prometheus_url %}
+You are using Coralogix Prometheus.
+* Metrics/labels may differ; discover names with `get_metric_names` first.
+* For high-cardinality, wrap with `topk(5, <query>)`.
+* Always include explicit time ranges for range queries.
+* Example: `container_cpu_utilization{namespace="test-173"}` can fail if the label is named differently (e.g., `k8s_namespace_name`) or the metric is named differently. Do not assume names—only use labels you have seen returned or been told exist.
+{%- endif %}
+
+## Metric discovery
+* `get_metric_names` with filters is the fastest discovery method; combine multiple patterns with regex OR to reduce API calls (e.g. `{__name__=~"node_cpu.*|node_memory.*|node_disk.*"}`, `{namespace=~"example1|example2"}`).
+* `get_metric_metadata` gives types/descriptions after discovery; `get_label_values` discovers pods, namespaces, jobs (e.g. get_label_values(label="pod")); only use `get_series` when you need full label sets (slower).
+
+## Executing queries
+* When investigating a Prometheus alert, ALWAYS call list_prometheus_rules to get the alert definition, and query the metrics from the alert's promql.
+* Run promql with `execute_prometheus_instant_query` and `execute_prometheus_range_query`, using 'start_timestamp'/'end_timestamp' as the graph's start and end times. Timestamps MUST be string dates, e.g. '2025-03-15 10:10:08.610862+00:00'. Extend the time range to 15 min before and after an alert's start time.
+* Before querying, confirm any node/service/pod/container/namespace referenced in the query exists, using kubectl tools.
+* The tool call returns no data to you — that is expected. You MUST still ensure the query succeeds. Post-processing re-runs the query and renders a chart the user can see.
+* ALWAYS embed a Prometheus graph in your answer to visualize data related to the incident — at most 2 graphs, with a blank line between them. Embed by referencing the tool call: << {"type": "promql", "tool_name": "execute_prometheus_range_query", "tool_call_id": "92jf2hf"} >>
+* Useful standard metrics: memory `container_memory_working_set_bytes`; CPU `container_cpu_usage_seconds_total`; throttling `container_cpu_cfs_throttled_periods_total`. For latencies prefer `rate(<metric>_sum) / rate(<metric>_count)` over `_bucket` (unless bucket boundaries are known good), and prefer per-series averages over global averages, which hide data.
+
+## Query resolution & data points
+* Range queries return up to {{ default_max_points }} data points per series by default (`max_points` parameter controls this).
+* When investigating spikes or short-lived events, increase `max_points` up to {{ hard_max_points }} — spikes can disappear at low resolution — but only for low-cardinality queries (1-3 series). For higher resolution still, narrow the time range (e.g. a 30-minute window around the spike).
+
+## High-cardinality metrics and too much data
+* When a query may return many series (>10) — pod-level metrics in busy namespaces, container CPU/memory, HTTP metrics with many endpoints — ALWAYS aggregate: use `topk(5, <query>)` or `bottomk(...)`, e.g. `topk(5, rate(container_cpu_usage_seconds_total{namespace="example"}[5m]))`.
+* To also capture the remaining series as "other":
+  ```
+  topk(5, rate(container_cpu_usage_seconds_total{namespace="example"}[5m])) or label_replace((sum(rate(container_cpu_usage_seconds_total{namespace="example"}[5m])) - sum(topk(5, rate(container_cpu_usage_seconds_total{namespace="example"}[5m])))), "pod", "other", "", "")
+  ```
+* For initial exploration you may check cardinality with an instant query: `count(count by (pod) (container_cpu_usage_seconds_total{namespace="example"}))` — if count > 10, use topk() in your range query.
+* If a query returns too much data (e.g. truncation error), you MUST retry with a more specific query, fewer data points, or topk/bottomk. NEVER answer based on truncated Prometheus data — you might be missing the information that changes the answer. Prefer saying you can't answer (and showing the user a graph via the promql embed so they can interpret it themselves) over answering from incomplete data.
+* Do not answer about metric values you haven't seen: the existence of a label value says nothing about the metric's value (and the label may belong to an old series), and "typically the case" domain knowledge is not evidence. State your limitations instead.
+
+{%- if config and config.additional_labels and config.additional_labels.keys()|list|length > 0 %}
+* ALWAYS add the following additional labels to ALL PromQL queries:
+{%- for key, value in config.additional_labels.items() %}
+  * {{ key }}="{{ value }}"
+{%- endfor -%}
+{%- endif -%}

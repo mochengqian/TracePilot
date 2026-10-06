@@ -1,0 +1,178 @@
+"""
+LLM Summarize Transformer for fast model summarization of large tool outputs.
+
+LEGACY — disabled by default and NOT recommended. This predates the
+spill-to-disk mechanism (see docs/reference/context-management.md) and never
+worked well in practice: summarization is lossy (the original tool output is
+unrecoverable afterwards), adds latency and cost to every large tool call,
+and modern models do better working from the full data spilled to disk.
+Kept for backwards compatibility with existing configs that reference it.
+"""
+
+import logging
+from typing import ClassVar, Optional
+
+from pydantic import Field, PrivateAttr, StrictStr
+
+from ..llm import LLM, DefaultLLM
+from .base import BaseTransformer, TransformerError
+
+logger = logging.getLogger(__name__)
+
+
+class LLMSummarizeTransformer(BaseTransformer):
+    """
+    Transformer that uses a fast LLM model to summarize large tool outputs.
+
+    LEGACY — disabled by default and NOT recommended (see module docstring).
+    Prefer the spill-to-disk mechanism, which preserves the full tool output
+    on disk for the model to read back.
+
+    This transformer applies summarization when:
+    1. A fast model is available
+    2. The input length exceeds the configured threshold
+
+    Configuration options:
+    - input_threshold: Minimum input length to trigger summarization (default: 1000)
+    - prompt: Custom prompt template for summarization (optional)
+    - fast_model: Fast model name for summarization (e.g., "gpt-4o-mini")
+    - api_key: API key for the fast model (optional, uses default if not provided)
+    """
+
+    DEFAULT_PROMPT: ClassVar[str] = """Summarize this operational data focusing on:
+- What needs attention or immediate action
+- Group similar entries into a single line and description
+- Make sure to mention outliers, errors, and non-standard patterns
+- List normal/healthy patterns as aggregate descriptions
+- When listing problematic entries, also try to use aggregate descriptions when possible
+- When possible, mention exact keywords, IDs, or patterns so the user can filter/search the original data and drill down on the parts they care about (extraction over abstraction)"""
+
+    # Class-level default fast model — set once at startup by Config.
+    # Individual instances can override via the ``fast_model`` field.
+    _default_fast_model: ClassVar[Optional[str]] = None
+
+    # Pydantic fields with validation
+    input_threshold: int = Field(
+        default=1000, ge=0, description="Minimum input length to trigger summarization"
+    )
+    prompt: Optional[StrictStr] = Field(
+        default=None,
+        min_length=1,
+        description="Custom prompt template for summarization",
+    )
+    fast_model: Optional[StrictStr] = Field(
+        default=None,
+        min_length=1,
+        description="Fast model name for summarization (e.g., 'gpt-4o-mini')",
+    )
+    api_key: Optional[str] = Field(
+        default=None,
+        description="API key for the fast model (optional, uses default if not provided)",
+    )
+
+    # Private attribute for the LLM instance (not serialized)
+    _fast_llm: Optional[LLM] = PrivateAttr(default=None)
+
+    @classmethod
+    def set_default_fast_model(cls, model: str) -> None:
+        """Set the class-level default fast model (called once at startup)."""
+        cls._default_fast_model = model
+        logger.info(f"Set default fast model for LLMSummarizeTransformer: {model}")
+
+    def model_post_init(self, __context) -> None:
+        """Initialize the fast LLM instance after model validation."""
+        self._fast_llm = None
+
+        # Explicit per-instance fast_model wins over class-level default
+        effective_fast_model = self.fast_model or self._default_fast_model
+
+        if effective_fast_model:
+            try:
+                self._fast_llm = DefaultLLM(effective_fast_model, self.api_key)
+                logger.info(
+                    f"Created fast LLM instance with model: {effective_fast_model}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create fast LLM instance: {e}")
+                self._fast_llm = None
+
+    def should_apply(self, input_text: str) -> bool:
+        """
+        Determine if summarization should be applied to the input.
+
+        Args:
+            input_text: The tool output to check
+
+        Returns:
+            True if summarization should be applied, False otherwise
+        """
+        logger = logging.getLogger(__name__)
+
+        # Skip if no fast model is configured
+        if self._fast_llm is None:
+            logger.debug("Skipping summarization: no fast model configured")
+            return False
+
+        # Check if input exceeds threshold
+        input_length = len(input_text)
+
+        if input_length <= self.input_threshold:
+            logger.debug(
+                f"Skipping summarization: input length {input_length} <= threshold {self.input_threshold}"
+            )
+            return False
+
+        logger.debug(
+            f"Applying summarization: input length {input_length} > threshold {self.input_threshold}"
+        )
+        return True
+
+    def transform(self, input_text: str) -> str:
+        """
+        Transform the input text by summarizing it with the fast model.
+
+        Args:
+            input_text: The tool output to summarize
+
+        Returns:
+            Summarized text
+
+        Raises:
+            TransformerError: If summarization fails
+        """
+        if self._fast_llm is None:
+            raise TransformerError("Cannot transform: no fast model configured")
+
+        try:
+            # Get the prompt to use
+            prompt = self.prompt or self.DEFAULT_PROMPT
+
+            # Construct the full prompt with the content
+            full_prompt = f"{prompt}\n\nContent to summarize:\n{input_text}"
+
+            # Perform the summarization
+            logger.debug(f"Summarizing {len(input_text)} characters with fast model")
+
+            response = self._fast_llm.completion(
+                [{"role": "user", "content": full_prompt}]
+            )
+            summarized_text = response.choices[0].message.content  # type: ignore
+
+            if not summarized_text or not summarized_text.strip():
+                raise TransformerError("Fast model returned empty summary")
+
+            logger.debug(
+                f"Summarization complete: {len(input_text)} -> {len(summarized_text)} characters"
+            )
+
+            return summarized_text.strip()
+
+        except Exception as e:
+            error_msg = f"Failed to summarize content with fast model: {e}"
+            logger.error(error_msg)
+            raise TransformerError(error_msg) from e
+
+    @property
+    def name(self) -> str:
+        """Get the transformer name."""
+        return "llm_summarize"

@@ -1,0 +1,301 @@
+import logging
+import os
+import os.path
+from typing import Any, List, Optional, Union
+
+import yaml  # type: ignore
+from pydantic import ValidationError
+
+import holmes.utils.env as env_utils
+from holmes.common.env_vars import (
+    DISABLE_PROMETHEUS_TOOLSET,
+    USE_LEGACY_KUBERNETES_LOGS,
+)
+from holmes.core.supabase_dal import SupabaseDal
+from holmes.core.tools import (
+    Toolset,
+    ToolsetStatusEnum,
+    ToolsetType,
+    ToolsetYamlFromConfig,
+    YAMLToolset,
+)
+from holmes.plugins.toolsets.atlas_mongodb.mongodb_atlas import MongoDBAtlasToolset
+from holmes.plugins.toolsets.bash.bash_toolset import BashExecutorToolset
+from holmes.plugins.toolsets.confluence.confluence import ConfluenceToolset
+from holmes.plugins.toolsets.connectivity_check import ConnectivityCheckToolset
+from holmes.plugins.toolsets.coralogix.toolset_coralogix import CoralogixToolset
+from holmes.plugins.toolsets.database.database import DatabaseToolset
+from holmes.plugins.toolsets.mongodb.mongodb import MongoDBToolset
+from holmes.plugins.toolsets.datadog.toolset_datadog_general import (
+    DatadogGeneralToolset,
+)
+from holmes.plugins.toolsets.datadog.toolset_datadog_logs import DatadogLogsToolset
+from holmes.plugins.toolsets.datadog.toolset_datadog_metrics import (
+    DatadogMetricsToolset,
+)
+from holmes.plugins.toolsets.datadog.toolset_datadog_traces import (
+    DatadogTracesToolset,
+)
+from holmes.plugins.toolsets.elasticsearch.elasticsearch import (
+    ElasticsearchClusterToolset,
+    ElasticsearchDataToolset,
+)
+from holmes.plugins.toolsets.elasticsearch.opensearch_query_assist import (
+    OpenSearchQueryAssistToolset,
+)
+from holmes.plugins.toolsets.grafana.loki.toolset_grafana_loki import GrafanaLokiToolset
+from holmes.plugins.toolsets.grafana.toolset_grafana import GrafanaToolset
+from holmes.plugins.toolsets.grafana.toolset_grafana_tempo import GrafanaTempoToolset
+from holmes.plugins.toolsets.http.http_toolset import HttpToolset
+from holmes.plugins.toolsets.internet.internet import InternetToolset
+from holmes.plugins.toolsets.internet.notion import NotionToolset
+from holmes.plugins.toolsets.investigator.core_investigation import (
+    CoreInvestigationToolset,
+)
+from holmes.plugins.toolsets.kafka import KafkaToolset
+from holmes.plugins.toolsets.kubectl_run.kubectl_run_toolset import KubectlRunToolset
+from holmes.plugins.toolsets.kubernetes_logs import KubernetesLogsToolset
+from holmes.plugins.toolsets.mcp.toolset_mcp import RemoteMCPToolset
+from holmes.plugins.toolsets.multi_instance import multi_instance
+from holmes.plugins.toolsets.newrelic.newrelic import NewRelicToolset
+from holmes.plugins.toolsets.rabbitmq.toolset_rabbitmq import RabbitMQToolset
+from holmes.plugins.toolsets.robusta.robusta import RobustaToolset
+from holmes.plugins.toolsets.robusta_platform_mcp.robusta_platform_mcp import (
+    make_robusta_platform_mcp_toolset,
+)
+from holmes.plugins.toolsets.skills.skills_fetcher import SkillsToolset
+from holmes.plugins.toolsets.servicenow_tables.servicenow_tables import (
+    ServiceNowTablesToolset,
+)
+from holmes.plugins.toolsets.victorialogs.victorialogs import VictoriaLogsToolset
+
+THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+
+
+def load_toolsets_from_file(
+    toolsets_path: str, strict_check: bool = True
+) -> List[Toolset]:
+    toolsets = []
+    with open(toolsets_path) as file:
+        parsed_yaml = yaml.safe_load(file)
+        if parsed_yaml is None:
+            raise ValueError(
+                f"Failed to load toolsets from {toolsets_path}: file is empty or invalid YAML."
+            )
+        toolsets_dict = parsed_yaml.get("toolsets", {})
+        mcp_config = parsed_yaml.get("mcp_servers", {})
+
+        for server_config in mcp_config.values():
+            server_config["type"] = ToolsetType.MCP.value
+            server_config.setdefault("enabled", True)
+
+        toolsets_dict.update(mcp_config)
+
+        toolsets.extend(load_toolsets_from_config(toolsets_dict, strict_check))
+
+    return toolsets
+
+
+def load_python_toolsets(
+    dal: Optional[SupabaseDal],
+    additional_search_paths: Optional[List[str]] = None,
+) -> List[Toolset]:
+    logging.debug("loading python toolsets")
+    toolsets: list[Toolset] = [
+        CoreInvestigationToolset(),  # Load first for higher priority
+        InternetToolset(),
+        ConnectivityCheckToolset(),
+        RobustaToolset(dal),
+        multi_instance(GrafanaLokiToolset),
+        multi_instance(GrafanaTempoToolset),
+        multi_instance(NewRelicToolset),
+        multi_instance(GrafanaToolset),
+        NotionToolset(),
+        KafkaToolset(),
+        multi_instance(DatadogLogsToolset),
+        multi_instance(DatadogGeneralToolset),
+        multi_instance(DatadogMetricsToolset),
+        multi_instance(DatadogTracesToolset),
+        OpenSearchQueryAssistToolset(),
+        multi_instance(CoralogixToolset),
+        RabbitMQToolset(),
+        BashExecutorToolset(),
+        KubectlRunToolset(),
+        multi_instance(ConfluenceToolset),
+        multi_instance(MongoDBAtlasToolset),
+        SkillsToolset(dal=dal, additional_search_paths=additional_search_paths),
+        multi_instance(ServiceNowTablesToolset),
+        multi_instance(VictoriaLogsToolset),
+        DatabaseToolset(),
+        multi_instance(ElasticsearchDataToolset),
+        multi_instance(ElasticsearchClusterToolset),
+    ]
+
+    if not DISABLE_PROMETHEUS_TOOLSET:
+        from holmes.plugins.toolsets.prometheus.prometheus import PrometheusToolset
+
+        toolsets.append(multi_instance(PrometheusToolset))
+
+    if not USE_LEGACY_KUBERNETES_LOGS:
+        toolsets.append(KubernetesLogsToolset())
+
+    platform_mcp = make_robusta_platform_mcp_toolset(dal)
+    if platform_mcp is not None:
+        toolsets.append(platform_mcp)
+
+    return toolsets
+
+
+def load_builtin_toolsets(
+    dal: Optional[SupabaseDal] = None,
+    additional_search_paths: Optional[List[str]] = None,
+) -> List[Toolset]:
+    all_toolsets: List[Toolset] = []
+    logging.debug(f"loading toolsets from {THIS_DIR}")
+
+    # Handle YAML toolsets
+    for filename in os.listdir(THIS_DIR):
+        if not filename.endswith(".yaml"):
+            continue
+
+        if filename == "kubernetes_logs.yaml" and not USE_LEGACY_KUBERNETES_LOGS:
+            continue
+
+        path = os.path.join(THIS_DIR, filename)
+        toolsets_from_file = load_toolsets_from_file(path, strict_check=True)
+        all_toolsets.extend(toolsets_from_file)
+
+    all_toolsets.extend(
+        load_python_toolsets(dal=dal, additional_search_paths=additional_search_paths)
+    )  # type: ignore
+
+    # disable built-in toolsets by default, and the user can enable them explicitly in config.
+    for toolset in all_toolsets:
+        toolset.type = ToolsetType.BUILTIN
+        # dont' expose build-in toolsets path
+        toolset.path = None
+
+    return all_toolsets  # type: ignore
+
+
+def is_old_toolset_config(
+    toolsets: Union[dict[str, dict[str, Any]], List[dict[str, Any]]],
+) -> bool:
+    # old config is a list of toolsets
+    if isinstance(toolsets, list):
+        return True
+    return False
+
+
+def _make_invalid_toolset_placeholder(
+    name: str, error: str, type_hint: Optional[str] = None
+) -> Toolset:
+    """Build a minimal Toolset whose prerequisite check fails with the given error.
+
+    Used when a user-supplied toolset entry can't be constructed (unknown field,
+    wrong type, invalid enum value, etc.). Without this placeholder the toolset
+    would silently disappear from the frontend; with it the user sees a clear
+    "failed" entry carrying the Pydantic/ValueError message so they know what
+    to fix in their YAML.
+    """
+    from holmes.core.tools import StaticPrerequisite
+
+    description = (
+        f"Invalid toolset configuration ({type_hint})"
+        if type_hint
+        else "Invalid toolset configuration"
+    )
+    placeholder = Toolset(
+        name=name,
+        description=description,
+        tools=[],
+        enabled=True,  # must be True so check_prerequisites runs and keeps it FAILED
+        prerequisites=[
+            StaticPrerequisite(enabled=False, disabled_reason=error)
+        ],
+    )
+    # Set FAILED status + error up front so the sync layer sees them even if
+    # check_prerequisites is skipped (e.g. on cached startup paths).
+    placeholder.status = ToolsetStatusEnum.FAILED
+    placeholder.error = error
+    return placeholder
+
+
+def load_toolsets_from_config(
+    toolsets: dict[str, dict[str, Any]],
+    strict_check: bool = True,
+) -> List[Toolset]:
+    """
+    Load toolsets from a dictionary or list of dictionaries.
+    :param toolsets: Dictionary of toolsets or list of toolset configurations.
+    :param strict_check: If True, all required fields for a toolset must be present.
+    :return: List of validated Toolset objects.
+    """
+
+    if not toolsets:
+        return []
+
+    loaded_toolsets: list[Toolset] = []
+    if is_old_toolset_config(toolsets):
+        message = "Old toolset config format detected, please update to the new format: https://holmesgpt.dev/data-sources/custom-toolsets/"
+        logging.warning(message)
+        raise ValueError(message)
+
+    for name, config in toolsets.items():
+        toolset_type: Optional[str] = None
+        try:
+            toolset_type = config.get("type", ToolsetType.BUILTIN.value)
+
+            # Resolve env var placeholders before creating the Toolset.
+            # If done after, .override_with() will overwrite resolved values with placeholders
+            # because model_dump() returns the original, unprocessed config from YAML.
+            #
+            # For MCP servers, preserve extra_headers templates so they can be
+            # dynamically resolved at request time (e.g., for refreshing tokens).
+            saved_extra_headers = None
+            if toolset_type == ToolsetType.MCP.value and isinstance(
+                config.get("config"), dict
+            ):
+                saved_extra_headers = config["config"].pop("extra_headers", None)
+
+            if config:
+                config = env_utils.replace_env_vars_values(config)
+
+            if saved_extra_headers is not None:
+                config.setdefault("config", {})["extra_headers"] = saved_extra_headers
+
+            validated_toolset: Optional[Toolset] = None
+            # MCP server is not a built-in toolset, so we need to set the type explicitly
+            if toolset_type == ToolsetType.MCP.value:
+                validated_toolset = RemoteMCPToolset(**config, name=name)
+            elif toolset_type == ToolsetType.HTTP.value:
+                validated_toolset = HttpToolset(name=name, **config)
+            elif toolset_type == ToolsetType.DATABASE.value:
+                validated_toolset = DatabaseToolset(name=name, **config)
+            elif toolset_type == ToolsetType.MONGODB.value:
+                validated_toolset = MongoDBToolset(name=name, **config)
+            elif strict_check:
+                validated_toolset = YAMLToolset(**config, name=name)  # type: ignore
+            else:
+                validated_toolset = ToolsetYamlFromConfig(  # type: ignore
+                    **config, name=name
+                )
+
+            loaded_toolsets.append(validated_toolset)
+        except ValidationError as e:
+            logging.warning(f"Toolset '{name}' is invalid: {e}")
+            loaded_toolsets.append(
+                _make_invalid_toolset_placeholder(
+                    name=name, error=str(e), type_hint=toolset_type
+                )
+            )
+
+        except Exception as e:
+            logging.warning("Failed to load toolset: %s", name, exc_info=True)
+            loaded_toolsets.append(
+                _make_invalid_toolset_placeholder(
+                    name=name, error=str(e), type_hint=toolset_type
+                )
+            )
+
+    return loaded_toolsets

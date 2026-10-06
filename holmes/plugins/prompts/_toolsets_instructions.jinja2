@@ -1,0 +1,36 @@
+{%- set enabled_toolsets_with_instructions = [] -%}
+{%- set disabled_toolsets = [] -%}
+
+{%- for toolset in toolsets -%}
+  {%- if toolset.llm_instructions and toolset.status.value == "enabled" -%}
+    {%- set _ = enabled_toolsets_with_instructions.append(toolset) -%}
+  {%- elif toolset.status.value != "enabled" -%}
+    {%- set _ = disabled_toolsets.append(toolset) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+# Available Toolsets
+{% include '_fetch_logs.jinja2' %}
+
+{% if enabled_toolsets_with_instructions|list %}
+{%- for toolset in enabled_toolsets_with_instructions -%}
+{% if toolset.llm_instructions %}
+
+## {{ toolset.name }}
+{{ toolset.llm_instructions }}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+
+# Disabled & failed Toolsets
+{% if disabled_toolsets %}
+These toolsets are DISABLED (unconfigured) unless marked FAILED (misconfigured). Setup docs per toolset: `https://holmesgpt.dev/data-sources/builtin-toolsets/<name before any slash>/` unless a different URL is given.
+{% for toolset in disabled_toolsets %}
+{%- set default_docs_url = "https://holmesgpt.dev/data-sources/builtin-toolsets/" ~ toolset.name.split("/")[0] ~ "/" %}
+* {{ toolset.name }}{% if toolset.status.value == "failed" %} (FAILED{% if toolset.error %}, error: {{ toolset.error }}{% endif %}){% endif %}: {{ toolset.description }}{% if toolset.docs_url and toolset.docs_url != default_docs_url %} [setup: {{ toolset.docs_url }}]{% endif %}
+{%- endfor %}
+{% else %}
+<no toolsets are disabled or failed>
+{% endif %}
+
+If you need a system you can't reach with your current tools: for a matching FAILED toolset, tell the user and copy its error into your response; for a matching disabled toolset (including when users ask how to set up or grant access to a system), ask the user to configure it and share its setup URL. If no toolset matches, say you're missing an integration for that system and that one can be added via an [HTTP connector](https://holmesgpt.dev/data-sources/api-toolsets/) (quickest for REST APIs — supports auth, endpoint whitelisting and response filtering), an [MCP server](https://holmesgpt.dev/data-sources/remote-mcp-servers/), or a [custom toolset](https://holmesgpt.dev/data-sources/custom-toolsets/).
