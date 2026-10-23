@@ -26,8 +26,10 @@ class ScopeBinding(Record):
             raise ValueError("Scope bindings must be nonempty and distinct")
         return self
 
-    def validate_arguments(self, args: dict[str, Any], scope: InvestigationScope) -> None:
-        if args.get(self.service) != scope.service or args.get(self.namespace) != scope.namespace:
+    def validate_arguments(self, args: dict[str, Any], scope: InvestigationScope,
+                           allowed_services: frozenset[str] | None = None) -> None:
+        services = allowed_services or frozenset({scope.service})
+        if args.get(self.service) not in services or args.get(self.namespace) != scope.namespace:
             raise PermissionError("Tool arguments exceed task service/namespace scope")
         if self.start is not None and self.end is not None:
             try:

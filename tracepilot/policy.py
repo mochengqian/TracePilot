@@ -44,4 +44,12 @@ def available_actions(state: DecisionState) -> dict[str, Any]:
                 "tool": candidate.tool, "purpose": candidate.purpose,
                 "direction": candidate.direction, "arguments": candidate.arguments,
             }
+    for group in state.groups:
+        if (len(group.children) <= state.budget.max_parallel_tools
+                and state.tool_calls + len(group.children) <= state.budget.max_tool_calls
+                and all(child.tool in catalog and can_attempt(state, child, catalog[child.tool])
+                        for child in group.children)):
+            actions[f"parallel:{group.id}"] = {
+                "purpose": group.purpose, "children": [c.model_dump() for c in group.children],
+            }
     return actions

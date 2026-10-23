@@ -19,4 +19,5 @@ def render_diagnosis(draft: DiagnosisDraft, state: DecisionState, valid_ids: set
     return Diagnosis(
         summary=summary, causes=draft.causes, verification_steps=draft.verification_steps,
         limitations=draft.limitations, schema_version=2, outcome=outcome,
+        remediation_suggestions=draft.remediation_suggestions,
     )

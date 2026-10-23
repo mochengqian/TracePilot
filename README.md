@@ -28,6 +28,8 @@ python -m tracepilot verify TASK_ID
 
 真实模型、PostgreSQL、MCP 和数据源配置见 [运行指南](docs/reference/tracepilot.md)。完整 Poetry 环境还提供 `tracepilot` 命令；独立入口无需加载原有集成框架。
 
+SRE OnCall 支持 Alertmanager Webhook → 持久化诊断任务 → 后台 Worker → 证据与报告。API 和 Worker 独立运行，使用 PostgreSQL 领取任务、续租与恢复，提供租户隔离的任务/证据查询及 SSE。启动示例、真实数据源配置和恢复语义见 [OnCall 运行指南](docs/reference/tracepilot-oncall.md)。
+
 ## 核心能力
 
 | 能力 | 实现 | 验证方式 |
@@ -35,6 +37,8 @@ python -m tracepilot verify TASK_ID
 | 推理与动作选择分离 | `tracepilot/providers.py`、`engine.py`、`policy.py` | Jev 只能选择 Runtime 提供的动作，不能直接执行工具 |
 | 多轮证据驱动排查 | `DecisionState`、结构化记忆、候选方向 | 相同超时问题根据证据进入连接池或下游分支 |
 | Evidence Memory | `tracepilot/store.py`、`models.py` | 事务保存任务/观测/事件，分页读取，校验内容与来源摘要 |
+| 告警接入与后台调查 | `api.py`、`oncall.py`、`task_store.py`、`worker.py` | 重复/乱序通知、事务建任务、租约代次与断点恢复 |
+| 受控并行与修复建议 | ActionGroup、统一预算、结构化报告 | 独立查询并发、结果串行提交、建议引用校验 |
 | 独立 MCP 工具层 | `tracepilot/mcp_gateway.py` | stdio、Streamable HTTP、分页发现、命名空间、Schema 变化检测 |
 | 真实观测接口 | `tracepilot/observability_server.py` | Loki 日志、Prometheus 指标、Tempo 调用链搜索、Kubernetes 当前实例状态 |
 | 执行约束 | 本地白名单、服务/命名空间/时间范围、输入输出 Schema | 越界不调用、审批时停止、有界重试和上下文容量限制 |
@@ -140,4 +144,4 @@ python -m pytest -c tests/tracepilot/pytest.ini --confcutdir=tests/tracepilot \
 
 本仓库由 HolmesGPT 派生；TracePilot 是本分支的产品名称。原有代码与贡献记录保留，新增工作与既有实现的关系见 [来源说明](THIRD_PARTY_NOTICES.md)。[原始 README](UPSTREAM_README.md) 和 [Apache-2.0 许可证](LICENSE) 保留。
 
-`completed` 表示调查流程结束，不表示根因已确认。引用校验能检查来源，不能证明推断在语义上正确。生产准确率、成本收益与 Jev 概率校准需要接入目标环境后测量。当前为单用户 CLI，未实现多租户调度、自动修复或中断任务自动重放。
+`completed` 表示调查流程结束，不表示根因已确认。引用校验能检查来源，不能证明推断在语义上正确。生产准确率、成本收益与 Jev 概率校准需要接入目标环境后测量。OnCall 提供租户鉴权与持久化调度；诊断默认只读，不执行自动修复。未知结果仅对本地声明安全的查询有限重试，不承诺外部调用恰好一次。

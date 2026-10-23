@@ -16,5 +16,8 @@ mcp_servers:
         read_only: true
         retry_safe: true
       service_metrics: *read_policy
+      service_metric_summary: *read_policy
       service_traces: *read_policy
+      service_trace_detail: *read_policy
       service_instances: *read_policy
+      service_events: *read_policy

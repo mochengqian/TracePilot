@@ -35,9 +35,12 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: requirements-tracepilot.txt
-      - run: pip install -r requirements-tracepilot.txt pytest responses
+      - run: pip install -r requirements-tracepilot.txt pytest responses pytest-cov
       - name: Runtime, MCP, legacy contracts and PostgreSQL
         run: >-
           python -m pytest -c tests/tracepilot/pytest.ini --confcutdir=tests/tracepilot
           tests/tracepilot tests/decision/test_engine.py tests/decision/test_runtime_regressions.py
           tests/decision/test_store.py tests/decision/test_providers.py
+          --cov=tracepilot --cov-report=term-missing --cov-fail-under=40
+      - name: Deterministic OnCall scenario evaluation
+        run: python -m tracepilot evaluate --decision scripted --database-url sqlite://
