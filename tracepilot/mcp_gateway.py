@@ -14,6 +14,7 @@ from mcp.types import CallToolResult, Tool
 
 from tracepilot.config import MCPServerConfig
 from tracepilot.gateway import tool_error_output
+from tracepilot.limits import remaining_timeout
 from tracepilot.models import Candidate, InvestigationScope, ToolOutput, ToolSpec, fingerprint
 from tracepilot.validation import validator
 
@@ -26,9 +27,13 @@ def required_environment(name: str) -> str:
 
 
 class MCPGateway:
-    def __init__(self, servers: dict[str, MCPServerConfig], scope: InvestigationScope):
+    def __init__(self, servers: dict[str, MCPServerConfig], scope: InvestigationScope,
+                 allowed_services: list[str] | None = None):
         self.servers = servers
         self.scope = scope
+        self.allowed_services = frozenset(allowed_services or [scope.service])
+        if scope.service not in self.allowed_services:
+            raise ValueError("Primary service must be authorized")
         self._catalog: list[ToolSpec] = []
         self._routes: dict[str, tuple[str, str]] = {}
 
@@ -37,7 +42,8 @@ class MCPGateway:
         policy = server.tools[tool.name]
         if len(tool.model_dump_json()) > 32000:
             raise ValueError("MCP tool definition exceeds 32,000 characters")
-        identity = fingerprint({"server": server.model_dump(), "scope": self.scope.model_dump(mode="json")})
+        identity = fingerprint({"server": server.model_dump(), "scope": self.scope.model_dump(mode="json"),
+                                "allowed_services": sorted(self.allowed_services)})
         validator(tool.inputSchema)
         if tool.outputSchema is not None:
             validator(tool.outputSchema)
@@ -84,10 +90,10 @@ class MCPGateway:
         policy = server.tools[remote_name]
         if policy.approval_required:
             return ToolOutput(status="approval_required", error="Operator approval is required")
-        policy.scope.validate_arguments(candidate.arguments, self.scope)
+        policy.scope.validate_arguments(candidate.arguments, self.scope, self.allowed_services)
         validator(spec.parameters).validate(candidate.arguments)
         result = await session.call_tool(remote_name, candidate.arguments,
-                                         read_timeout_seconds=timedelta(seconds=server.timeout_seconds))
+                                         read_timeout_seconds=timedelta(seconds=remaining_timeout(server.timeout_seconds)))
         return self._normalize(result, spec, server.max_result_chars)
 
     @staticmethod
@@ -104,22 +110,24 @@ class MCPGateway:
                 validator(spec.output_schema).validate(content)
             except Exception:
                 return ToolOutput(status="error", error="MCP result failed its output schema", error_kind="unknown")
-        return ToolOutput(status="success", data=content)
+        status = "no_data" if isinstance(content, dict) and content.get("observation_status") == "no_data" else "success"
+        return ToolOutput(status=status, data=content)
 
     async def _operation(self, server_name: str, candidate: Candidate | None) -> list[ToolSpec] | ToolOutput:
         server = self.servers[server_name]
-        with anyio.fail_after(server.timeout_seconds):
+        timeout = remaining_timeout(server.timeout_seconds)
+        with anyio.fail_after(timeout):
             if server.transport == "stdio":
                 params = StdioServerParameters(command=sys.executable if server.command == "{python}" else server.command,
                                                args=server.args, env={n: required_environment(n) for n in server.env_names})
                 async with stdio_client(params) as (read, write):
-                    async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=server.timeout_seconds)) as session:
+                    async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=timeout)) as session:
                         return await self._session_operation(server_name, session, candidate)
             else:
                 headers = {header: required_environment(name) for header, name in server.headers_env.items()}
-                async with httpx.AsyncClient(headers=headers, timeout=server.timeout_seconds, follow_redirects=False) as client:
+                async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=False) as client:
                     async with streamable_http_client(server.url, http_client=client) as (read, write, _):
-                        async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=server.timeout_seconds)) as session:
+                        async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=timeout)) as session:
                             return await self._session_operation(server_name, session, candidate)
 
     def catalog(self, refresh: bool = True) -> list[ToolSpec]:
@@ -146,9 +154,18 @@ class MCPGateway:
             policy = self.servers[server_name].tools[remote_name]
             if policy.approval_required:
                 return ToolOutput(status="approval_required", error="Operator approval is required")
-            policy.scope.validate_arguments(candidate.arguments, self.scope)
+            policy.scope.validate_arguments(candidate.arguments, self.scope, self.allowed_services)
             result = anyio.run(self._operation, server_name, candidate)
             assert isinstance(result, ToolOutput)
             return result
         except Exception as exc:
             return tool_error_output(exc)
+
+    def validate_candidate(self, candidate: Candidate) -> None:
+        """Local preflight before a candidate is offered to the decision model."""
+        route = self._routes.get(candidate.tool)
+        if route is None:
+            raise PermissionError("Tool is outside the local allowlist")
+        server_name, remote_name = route
+        self.servers[server_name].tools[remote_name].scope.validate_arguments(
+            candidate.arguments, self.scope, self.allowed_services)

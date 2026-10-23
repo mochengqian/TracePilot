@@ -7,7 +7,7 @@ from sqlalchemy import (
     JSON, Column, ForeignKey, Integer, MetaData, String, Table,
     create_engine, insert, select, update,
 )
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from tracepilot.models import DecisionState, Diagnosis, Evidence, fingerprint, utc_now
 
@@ -48,43 +48,62 @@ class EvidenceStore:
     def initialize(self) -> None:
         self.metadata.create_all(self.engine)
 
-    def create(self, state: DecisionState) -> None:
-        with self.engine.begin() as conn:
-            conn.execute(insert(self.tasks).values(
-                id=state.task_id, revision=state.revision,
-                state=state.model_dump(mode="json"),
-            ))
+    def check_write(self, conn: Connection, state: DecisionState) -> None:
+        """Overridden by a leased worker store; runs in the checkpoint transaction."""
+
+    def create(self, state: DecisionState, *, connection: Connection | None = None) -> None:
+        if connection is None:
+            with self.engine.begin() as conn:
+                self.create(state, connection=conn)
+            return
+        connection.execute(insert(self.tasks).values(
+            id=state.task_id, revision=state.revision, state=state.model_dump(mode="json"),
+        ))
 
     def checkpoint(
         self, state: DecisionState, *, event: dict[str, Any],
         evidence: Evidence | None = None, diagnosis: Diagnosis | None = None,
+        connection: Connection | None = None,
     ) -> None:
         """Evidence, event, and state commit together, or none of them do."""
         if evidence is not None and evidence.task_id != state.task_id:
             raise ValueError("Evidence belongs to another task")
+        if connection is None:
+            with self.engine.begin() as conn:
+                self.checkpoint(state, event=event, evidence=evidence, diagnosis=diagnosis, connection=conn)
+            return
         next_revision = state.revision + 1
         data = state.model_dump(mode="json")
         data["revision"] = next_revision
         values: dict[str, Any] = {"state": data, "revision": next_revision}
         if diagnosis is not None:
             values["diagnosis"] = diagnosis.model_dump(mode="json")
-        with self.engine.begin() as conn:
-            changed = conn.execute(update(self.tasks).where(
-                self.tasks.c.id == state.task_id,
-                self.tasks.c.revision == state.revision,
-            ).values(**values))
-            if changed.rowcount != 1:
-                raise StaleCheckpoint("Task checkpoint changed; reload before retrying")
-            if evidence is not None:
-                conn.execute(insert(self.evidence).values(
-                    id=evidence.id, task_id=state.task_id,
-                    record=evidence.model_dump(mode="json"),
-                ))
-            conn.execute(insert(self.events).values(
-                id=str(uuid4()), task_id=state.task_id, revision=next_revision,
-                record={"at": utc_now().isoformat(), **event},
+        self.check_write(connection, state)
+        changed = connection.execute(update(self.tasks).where(
+            self.tasks.c.id == state.task_id,
+            self.tasks.c.revision == state.revision,
+        ).values(**values))
+        if changed.rowcount != 1:
+            raise StaleCheckpoint("Task checkpoint changed; reload before retrying")
+        if evidence is not None:
+            connection.execute(insert(self.evidence).values(
+                id=evidence.id, task_id=state.task_id,
+                record=evidence.model_dump(mode="json"),
             ))
+        connection.execute(insert(self.events).values(
+            id=str(uuid4()), task_id=state.task_id, revision=next_revision,
+            record={"at": utc_now().isoformat(), **event},
+        ))
         state.revision = next_revision
+
+    def events_since(self, task_id: str, after: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        if after < 0 or not 1 <= limit <= 500:
+            raise ValueError("Invalid event cursor or page size")
+        with self.engine.connect() as conn:
+            rows = conn.execute(select(self.events.c.revision, self.events.c.record).where(
+                self.events.c.task_id == task_id, self.events.c.revision > after,
+            ).order_by(self.events.c.revision).limit(limit)).all()
+        return [{"id": row.revision, **row.record} for row in rows]
 
     def load(self, task_id: str) -> DecisionState:
         with self.engine.connect() as conn:

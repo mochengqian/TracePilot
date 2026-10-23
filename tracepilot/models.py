@@ -11,8 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from tracepilot.errors import ToolErrorKind
 
 
-TaskStatus = Literal["running", "completed", "needs_input", "stopped", "failed"]
-TerminalStatus = Literal["completed", "needs_input", "stopped", "failed"]
+TaskStatus = Literal["queued", "running", "completed", "needs_input", "stopped", "failed", "cancelled"]
+TerminalStatus = Literal["completed", "needs_input", "stopped", "failed", "cancelled"]
 ToolStatus = Literal["success", "no_data", "error", "approval_required"]
 DiagnosisOutcome = Literal["legacy_unverified", "candidate_causes", "insufficient_evidence", "invalid_report"]
 
@@ -59,6 +59,14 @@ class Candidate(Record):
         return fingerprint({"tool": self.tool, "version": self.tool_version, "arguments": self.arguments})
 
 
+class ActionGroup(Record):
+    """Independent read-only queries; the runtime owns concurrency and budgets."""
+
+    id: str = Field(min_length=1, max_length=80)
+    purpose: str = Field(min_length=1, max_length=2000)
+    children: list[Candidate] = Field(min_length=2, max_length=8)
+
+
 class Claim(Record):
     text: str = Field(min_length=1, max_length=2000)
     evidence_ids: list[str] = Field(default_factory=list, max_length=30)
@@ -83,6 +91,7 @@ class TaskMemory(Record):
 class ReasoningResult(Record):
     memory: TaskMemory
     candidates: list[Candidate] = Field(default_factory=list, max_length=20)
+    groups: list[ActionGroup] = Field(default_factory=list, max_length=5)
 
 
 class Decision(Record):
@@ -154,6 +163,8 @@ class Budget(Record):
     max_no_progress: int = Field(default=3, ge=1, le=20)
     max_tool_attempts: int = Field(default=3, ge=1, le=5)
     max_context_chars: int = Field(default=160000, ge=8000, le=1000000)
+    max_parallel_tools: int = Field(default=1, ge=1, le=8)
+    max_model_tokens: int | None = Field(default=None, ge=1)
 
 
 class InvestigationScope(Record):
@@ -178,6 +189,7 @@ class DecisionState(Record):
     scope: InvestigationScope | None = None
     memory: TaskMemory = Field(default_factory=TaskMemory)
     candidates: list[Candidate] = Field(default_factory=list)
+    groups: list[ActionGroup] = Field(default_factory=list)
     available_tools: list[ToolSpec] = Field(default_factory=list)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     history: list[ActionRecord] = Field(default_factory=list)
@@ -193,6 +205,12 @@ class DecisionState(Record):
     stop_reason: str = ""
     revision: int = 0
     created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    deadline_at: datetime | None = None
+    model_tokens: int = 0
+    model_usage: list[dict[str, Any]] = Field(default_factory=list)
+    allowed_services: list[str] = Field(default_factory=list)
+    incident_revision: int = 0
 
     def model_state(self) -> dict[str, Any]:
         """Bound context independently of the durable full evidence records."""
@@ -202,6 +220,25 @@ class DecisionState(Record):
         result["known_evidence_ids"] = [e["id"] for e in self.evidence]
         return result
 
+    def decision_state(self) -> dict[str, Any]:
+        """Keep provenance/coverage but omit raw previews from routine decisions."""
+        result = self.model_state()
+        # Keep context bounded before sending, including for callers outside HTTP.
+        result["context"] = self.context
+        result["evidence"] = [{**{k: v for k, v in item.items() if k != "preview"},
+                               "preview": item.get("preview", "")[:800]}
+                              for item in self.evidence[-12:]]
+        result["available_tools"] = [{"name": t.name, "version": t.version} for t in self.available_tools]
+        return result
+
+
+class RemediationSuggestion(Record):
+    description: str = Field(min_length=1, max_length=2000)
+    evidence_ids: list[str] = Field(min_length=1, max_length=30)
+    preconditions: list[str] = Field(default_factory=list, max_length=10)
+    risks: list[str] = Field(default_factory=list, max_length=10)
+    verification_steps: list[str] = Field(default_factory=list, max_length=10)
+
 
 class DiagnosisDraft(Record):
     """LLM output has no free-text summary or model-selected outcome."""
@@ -210,12 +247,16 @@ class DiagnosisDraft(Record):
     causes: list[Claim] = Field(default_factory=list, max_length=20)
     verification_steps: list[str] = Field(default_factory=list, max_length=30)
     limitations: list[str] = Field(default_factory=list, max_length=20)
+    remediation_suggestions: list[RemediationSuggestion] = Field(default_factory=list, max_length=20)
 
     def validate_references(self, known_ids: set[str]) -> None:
         self.memory.validate_references(known_ids)
         for cause in self.causes:
             if not cause.evidence_ids or not set(cause.evidence_ids) <= known_ids:
                 raise ValueError("Every reported cause must cite known evidence")
+        for suggestion in self.remediation_suggestions:
+            if not set(suggestion.evidence_ids) <= known_ids:
+                raise ValueError("Remediation references unknown or invalid observations")
 
 
 class Diagnosis(Record):
@@ -226,6 +267,7 @@ class Diagnosis(Record):
     limitations: list[str] = Field(default_factory=list, max_length=20)
     schema_version: int = 1
     outcome: DiagnosisOutcome = "legacy_unverified"
+    remediation_suggestions: list[RemediationSuggestion] = Field(default_factory=list, max_length=20)
 
 
 class InvestigationResult(Record):

@@ -8,6 +8,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ra
 
 from tracepilot.config import LLMConfig
 from tracepilot.mcp_gateway import required_environment
+from tracepilot.limits import check_retry_deadline, remaining_timeout
 
 
 class ModelServiceError(RuntimeError):
@@ -25,11 +26,11 @@ class HTTPCompletion:
         self.usage: list[dict[str, Any]] = []
 
     @retry(retry=retry_if_exception_type(TransientModelError), stop=stop_after_attempt(2),
-           wait=wait_random_exponential(multiplier=0.5, max=2), reraise=True)
+           wait=wait_random_exponential(multiplier=0.5, max=2), before_sleep=check_retry_deadline, reraise=True)
     def _post(self, endpoint: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         try:
             response = requests.post(endpoint, headers=headers, json=payload,
-                                     timeout=self.config.timeout_seconds, allow_redirects=False)
+                                     timeout=remaining_timeout(self.config.timeout_seconds), allow_redirects=False)
         except (requests.Timeout, requests.ConnectionError) as exc:
             raise TransientModelError("Reasoning service connection failed") from exc
         if response.status_code == 429 or response.status_code >= 500:
@@ -54,6 +55,7 @@ class HTTPCompletion:
             }, {"model": config.model, "max_tokens": config.max_output_tokens,
                 "system": "\n".join(m["content"] for m in messages if m["role"] == "system"),
                 "messages": [m for m in messages if m["role"] != "system"]})
+            self.usage.append(result.get("usage", {}))
             if result.get("stop_reason") == "max_tokens":
                 raise ModelServiceError("Reasoning response exceeded its output budget")
             content = "".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text")
@@ -62,11 +64,11 @@ class HTTPCompletion:
             result = self._post(base.rstrip("/") + "/chat/completions", {"Authorization": f"Bearer {self.key}"}, {
                 "model": config.model, "messages": messages, "response_format": {"type": "json_object"},
                 "stream": False, "max_completion_tokens": config.max_output_tokens})
+            self.usage.append(result.get("usage", {}))
             choices = result.get("choices", [])
             if not choices or choices[0].get("finish_reason") != "stop":
                 raise ModelServiceError("Reasoning response did not finish normally")
             content = choices[0].get("message", {}).get("content")
         if not isinstance(content, str) or not content.strip():
             raise ModelServiceError("Reasoning response contains no text")
-        self.usage.append(result.get("usage", {}))
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])

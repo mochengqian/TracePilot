@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import typer
+import uvicorn
 
 from tracepilot import __version__
 from tracepilot.config import AgentConfig
@@ -14,10 +15,65 @@ from tracepilot.models import DecisionState, InvestigationResult, InvestigationS
 from tracepilot.providers import JevDecisionProvider, StructuredReasoner
 from tracepilot.scenarios import ScenarioDecisionProvider, ScenarioReasoner, ScenarioTools, demo_scope
 from tracepilot.store import EvidenceStore
+from tracepilot.api import create_app
+from tracepilot.oncall import OnCallConfig
+from tracepilot.task_store import TaskStore
+from tracepilot.worker import Worker
+from tracepilot.evaluation import LLMDecisionProvider, evaluate_fixture
+from tracepilot.scenarios import SCENARIOS
 
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False,
                   help="TracePilot — evidence-driven service incident investigations")
+
+
+@app.command()
+def serve(config: Path = typer.Option(..., exists=True, dir_okay=False),
+          host: str = "127.0.0.1", port: int = typer.Option(8080, min=1, max=65535)) -> None:
+    """Run authenticated Alertmanager ingress and task APIs (worker is separate)."""
+    settings = OnCallConfig.load(config)
+    uvicorn.run(create_app(settings), host=host, port=port)
+
+
+@app.command()
+def worker(config: Path = typer.Option(..., exists=True, dir_okay=False), once: bool = False) -> None:
+    """Claim persisted investigations, recover expired leases and execute diagnostics."""
+    settings = OnCallConfig.load(config)
+    settings.validate_secrets()
+    store = EvidenceStore.from_url(required_environment(settings.database_url_env))
+    tasks = TaskStore(store, settings)
+    tasks.initialize()
+    try:
+        if once:
+            Worker(tasks).run_once()
+        else:
+            Worker(tasks).run_forever()
+    finally:
+        store.engine.dispose()
+
+
+@app.command()
+def evaluate(config: Path | None = typer.Option(None, exists=True, dir_okay=False),
+             decision: str = typer.Option("scripted", help="scripted / jev / llm"),
+             database_url: str = "sqlite:///tracepilot-evaluation.db") -> None:
+    """Evaluate repeatable observations; jev/llm modes make paid model API calls."""
+    if decision not in {"scripted", "jev", "llm"}:
+        raise typer.BadParameter("Choose scripted, jev or llm")
+    if decision != "scripted" and config is None:
+        raise typer.BadParameter("Live model evaluation requires --config")
+    settings = AgentConfig.load(config) if config else None
+    store = open_store(database_url)
+    try:
+        for scenario in SCENARIOS:
+            if settings is not None and decision != "scripted":
+                reasoner = StructuredReasoner(HTTPCompletion(settings.llm))
+                provider = (JevDecisionProvider(required_environment(settings.jev_api_key_env), settings.jev_model)
+                            if decision == "jev" else LLMDecisionProvider(HTTPCompletion(settings.llm)))
+            else:
+                reasoner, provider = ScenarioReasoner(), ScenarioDecisionProvider()
+            typer.echo(json.dumps({"decision": decision, **evaluate_fixture(scenario, reasoner, provider, store)}, ensure_ascii=False))
+    finally:
+        store.engine.dispose()
 
 
 def open_store(url: str) -> EvidenceStore:

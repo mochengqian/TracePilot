@@ -8,6 +8,9 @@
 | 多轮自主诊断 | Agent Loop 与工具候选列表；固定调用顺序演示 | 根据调用链的实例与依赖信息调整参数；四种证据情形走不同分支；实际 Tempo 查询接口 | `test_runtime.py`、`test_end_to_end.py` |
 | Evidence Memory | 任务/证据/事件事务保存、事实引用和分页读取 | 完整记录摘要、重新打开数据库验证、损坏证据阻止报告 | `test_runtime.py`、原 `test_store.py` |
 | MCP Tool 抽象层 | 复用原框架工具生命周期 | 独立 stdio/HTTP、分页发现、白名单、作用域和输入输出 Schema；四类观测接口 | `test_mcp.py`、`test_contracts.py` |
+| SRE OnCall 服务化 | 独立 CLI 与事务证据存储 | Alertmanager 接入、告警轮次去重、租户鉴权、持久化领取、租约恢复、SSE | `test_oncall.py` |
+| 并行与可验证建议 | 单工具候选与候选原因报告 | ActionGroup 预算预留与并行 I/O、报告截止时间、建议引用校验 | `test_oncall_runtime.py` |
+| 观测与评测 | 日志、原始指标、Trace 搜索、当前 Pod | 指标模板、范围过滤后的 Trace 详情、Pod 事件、相同夹具上的动作选择对照入口 | `test_oncall_observability.py`、`evaluation.py` |
 
 测试位于 `tests/tracepilot/`；旧路径为兼容导出，新核心位于 `tracepilot/`，没有复制两套状态机。项目首页、独立 CLI 和运行指南采用 TracePilot 名称，许可证、原作者和源代码来源保留。
 
