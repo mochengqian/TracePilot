@@ -13,7 +13,7 @@
         <link rel="canonical" href="https://holmesgpt.dev/dev/reference/tracepilot/">
       
       
-        <link rel="prev" href="../../development/transformers/">
+        <link rel="prev" href="../tracepilot-oncall/">
       
       
         <link rel="next" href="../tracepilot-implementation/">
@@ -5061,6 +5061,8 @@
       
         
       
+        
+      
     
     
     
@@ -5100,6 +5102,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tracepilot-oncall/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    TracePilot OnCall
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -5775,7 +5805,7 @@
     
     
       <li class="md-path__item">
-        <a href="./" class="md-path__link">
+        <a href="../tracepilot-oncall/" class="md-path__link">
           
   <span class="md-ellipsis">
     Reference
@@ -5875,7 +5905,7 @@
 </tbody>
 </table>
 <p>每个前缀支持 <code>_URL</code>、可选 <code>_TOKEN</code>（Bearer）、<code>_TENANT</code> 和 <code>_CA_BUNDLE</code>。需要的变量必须加入 <code>env_names</code> 才传入 stdio 子进程；列出的变量必须存在且非空，不会把模型密钥自动传给工具进程。未配置 URL 的数据源不会注册工具。</p>
-<p>可用 <code>OBS_SERVICE_LABEL</code>、<code>OBS_NAMESPACE_LABEL</code>、<code>OBS_POD_LABEL</code> 调整 Loki/Prometheus 标签名，也需加入 <code>env_names</code>。不同标签名不能相同。指标名和标签必须符合实际埋点；空查询结果不表示系统健康。Tempo 当前实现为调用链搜索，不是任意跨服务图谱分析。</p>
+<p>可用 <code>OBS_SERVICE_LABEL</code>、<code>OBS_NAMESPACE_LABEL</code>、<code>OBS_POD_LABEL</code> 调整 Loki/Prometheus 标签名，也需加入 <code>env_names</code>。不同标签名不能相同。指标名和标签必须符合实际埋点；空查询结果不表示系统健康。新增指标模板、Trace 详情与实例事件接口见 <a href="../tracepilot-oncall/">OnCall 指南</a>，不提供任意跨服务图谱授权。</p>
 <p>HTTP 封装只执行 GET，拒绝重定向并限制响应为 2 MB；MCP 客户端另外限制返回大小。超限明确失败，需缩小查询范围，不会把丢弃的数据伪装成完整证据。外部 MCP <code>isError</code> 若没有可信类型信息，按未知错误处理，不根据错误文字猜测是否可重试。</p>
 <h2 id="mcp">自定义 MCP 服务<a class="headerlink" href="#mcp" title="Permanent link">&para;</a></h2>
 <div class="language-yaml highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nt">mcp_servers</span><span class="p">:</span>
@@ -5905,9 +5935,9 @@
 </span></code></pre></div>
 <p>默认真实任务使用 <code>tracepilot.db</code>，演示使用 <code>tracepilot-demo.db</code>；检查真实任务时应传入对应 URL 或设置环境变量。数据库继续使用 <code>decision_agent_tasks</code>、<code>decision_agent_evidence</code>、<code>decision_agent_events</code>，兼容此前记录。状态以 revision 乐观并发更新；证据、审计与状态一起提交；执行外部调用前先保存意图。</p>
 <p><code>verify</code> 对照状态检查点中的 SHA-256 检查返回值和完整证据记录。旧记录只有返回值摘要时仍可检查，<code>full_record_checks</code> 会显示较少的覆盖数。这是完整性检测，不是数字签名，不能抵御同时修改数据库记录和摘要的管理员。</p>
-<p>默认 20 轮、10 次工具尝试、5 次中间推理、300 秒循环预算；最后报告单独调用模型。只对本地声明可重试且类型明确的临时失败重试，重试也占用工具预算。相同工具版本与参数的已完成查询不会因候选 ID 改变而重放。</p>
-<p>模型上下文保留最近证据预览和动作，完整证据可分页读取；默认模型请求上限 160,000 字符，超限明确拒绝。字符限制不是 Token 精确计费。MCP 有单次超时；总循环预算在操作间检查，并不是涵盖最终报告的硬端到端截止时间。</p>
-<p>报告中事实和候选原因必须引用本任务的有效观测，不能引用错误、审批拒绝或证据读取动作作为独立根因依据。Runtime 生成摘要和 outcome；候选原因始终需要验证。数据库重开检查不等于中断任务自动恢复，目前不重放状态不明的外部调用。</p>
+<p>默认 20 轮、10 次工具尝试、5 次中间推理、300 秒总预算；最后报告单独调用模型，也使用剩余时间。只对本地声明可重试且类型明确的临时失败重试，重试也占用工具预算。相同工具版本与参数的已完成查询不会因候选 ID 改变而重放。</p>
+<p>模型上下文保留最近证据预览和动作，完整证据可分页读取；默认模型请求上限 160,000 字符，超限明确拒绝。字符限制不是 Token 精确计费。模型/MCP 使用剩余时间限制请求与重试，最终报告也检查截止时间；已发出的外部请求只能尽力取消。</p>
+<p>报告中事实、候选原因和修复建议必须引用本任务的有效观测，不能引用错误、审批拒绝或证据读取动作作为独立根因依据。Runtime 生成摘要和 outcome；候选原因始终需要验证。OnCall Worker 支持租约回收与检查点恢复，未知结果的有限重试规则见 <a href="../tracepilot-oncall/">OnCall 指南</a>；CLI run 仍只接受新任务。</p>
 <h2 id="_5">验证边界与接口参考<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h2>
 <p>测试验证模拟模型 HTTP 合同、真实本地 MCP 传输、范围拒绝、Schema 变更、证据损坏、数据库重开和多轮分支。没有运行真实付费 LLM/Jev、生产监控系统或生产准确率评测。CI 定义了 PostgreSQL 服务，但是否通过须以实际 CI 运行结果为准。</p>
 <p>接口参考：<a href="https://prometheus.io/docs/prometheus/latest/querying/api/">Prometheus API</a>、<a href="https://grafana.com/docs/loki/latest/reference/loki-http-api/">Loki API</a>、<a href="https://grafana.com/docs/tempo/latest/api_docs/">Tempo API</a>、<a href="https://github.com/modelcontextprotocol/python-sdk">MCP Python SDK</a>。</p>
@@ -5948,7 +5978,7 @@
       <nav class="md-footer__inner md-grid" aria-label="Footer" >
         
           
-          <a href="../../development/transformers/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Tool Output Transformers">
+          <a href="../tracepilot-oncall/" class="md-footer__link md-footer__link--prev" aria-label="Previous: TracePilot OnCall">
             <div class="md-footer__button md-icon">
               
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
@@ -5958,7 +5988,7 @@
                 Previous
               </span>
               <div class="md-ellipsis">
-                Tool Output Transformers
+                TracePilot OnCall
               </div>
             </div>
           </a>

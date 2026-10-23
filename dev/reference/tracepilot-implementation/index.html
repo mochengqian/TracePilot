@@ -5061,6 +5061,8 @@
       
         
       
+        
+      
     
     
     
@@ -5100,6 +5102,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tracepilot-oncall/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    TracePilot OnCall
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -5665,7 +5695,7 @@
     
     
       <li class="md-path__item">
-        <a href="../tracepilot/" class="md-path__link">
+        <a href="../tracepilot-oncall/" class="md-path__link">
           
   <span class="md-ellipsis">
     Reference
@@ -5738,6 +5768,24 @@
 <td>复用原框架工具生命周期</td>
 <td>独立 stdio/HTTP、分页发现、白名单、作用域和输入输出 Schema；四类观测接口</td>
 <td><code>test_mcp.py</code>、<code>test_contracts.py</code></td>
+</tr>
+<tr>
+<td>SRE OnCall 服务化</td>
+<td>独立 CLI 与事务证据存储</td>
+<td>Alertmanager 接入、告警轮次去重、租户鉴权、持久化领取、租约恢复、SSE</td>
+<td><code>test_oncall.py</code></td>
+</tr>
+<tr>
+<td>并行与可验证建议</td>
+<td>单工具候选与候选原因报告</td>
+<td>ActionGroup 预算预留与并行 I/O、报告截止时间、建议引用校验</td>
+<td><code>test_oncall_runtime.py</code></td>
+</tr>
+<tr>
+<td>观测与评测</td>
+<td>日志、原始指标、Trace 搜索、当前 Pod</td>
+<td>指标模板、范围过滤后的 Trace 详情、Pod 事件、相同夹具上的动作选择对照入口</td>
+<td><code>test_oncall_observability.py</code>、<code>evaluation.py</code></td>
 </tr>
 </tbody>
 </table>
