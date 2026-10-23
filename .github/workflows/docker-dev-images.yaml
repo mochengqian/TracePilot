@@ -52,23 +52,19 @@ jobs:
       run: |
         sed -i 's/__version__ = .*/__version__ = "${{ steps.dev_version.outputs.version }}"/g' holmes/__init__.py
 
-    - name: Check if PR is from fork
-      id: fork_check
+    - name: Select registry publishing policy
+      id: registry
+      env:
+        HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        BASE_REPOSITORY: ${{ github.repository }}
       run: |
-        HEAD_REPO="${{ github.event.pull_request.head.repo.full_name }}"
-        BASE_REPO="${{ github.repository }}"
-
-        if [ -z "$HEAD_REPO" ]; then
-          # Head repo data is unavailable (repo may have been deleted)
-          # Treat as fork to avoid attempting authenticated pushes
-          echo "⚠️ Head repo data is unavailable - skipping authenticated push"
-          echo "is_fork=true" >> $GITHUB_OUTPUT
-        elif [ "$HEAD_REPO" != "$BASE_REPO" ]; then
-          echo "📌 PR is from a fork ($HEAD_REPO != $BASE_REPO) - will build but not push"
-          echo "is_fork=true" >> $GITHUB_OUTPUT
+        # The inherited Workload Identity provider belongs to the upstream
+        # repository. Downstream repositories still build both images locally.
+        if [ -n "$HEAD_REPOSITORY" ] && [ "$HEAD_REPOSITORY" = "$BASE_REPOSITORY" ] && [ "$BASE_REPOSITORY" = "HolmesGPT/holmesgpt" ]; then
+          echo "publish=true" >> "$GITHUB_OUTPUT"
         else
-          echo "✅ PR is from the same repo ($HEAD_REPO)"
-          echo "is_fork=false" >> $GITHUB_OUTPUT
+          echo "publish=false" >> "$GITHUB_OUTPUT"
+          echo "Validating Docker builds without upstream registry authentication"
         fi
 
     - name: Get short SHA
@@ -80,7 +76,7 @@ jobs:
       run: echo "start=$(date +%s)" >> $GITHUB_OUTPUT
 
     - name: Comment build started
-      if: steps.fork_check.outputs.is_fork != 'true'
+      if: steps.registry.outputs.publish == 'true'
       uses: actions/github-script@v7
       with:
         script: |
@@ -188,31 +184,31 @@ jobs:
             core.info(`Commented on PR #${issue_number}`);
           }
 
-    # Registry auth - only for non-fork PRs (fork PRs don't have access to push anyway)
+    # Registry auth is restricted to the owning upstream repository.
     - uses: google-github-actions/auth@v2
-      if: steps.fork_check.outputs.is_fork != 'true'
+      if: steps.registry.outputs.publish == 'true'
       with:
         project_id: 'robusta-development'
         workload_identity_provider: 'projects/479654156100/locations/global/workloadIdentityPools/github/providers/robusta-repos'
 
     - name: Set up gcloud CLI
-      if: steps.fork_check.outputs.is_fork != 'true'
+      if: steps.registry.outputs.publish == 'true'
       uses: google-github-actions/setup-gcloud@v2
       with:
         project_id: robusta-development
 
     - name: Configure Docker Registry
-      if: steps.fork_check.outputs.is_fork != 'true'
+      if: steps.registry.outputs.publish == 'true'
       run: gcloud auth configure-docker us-central1-docker.pkg.dev
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    # For fork PRs: build only (no push, no registry tags)
-    # For non-fork PRs: build and push to registry
+    # All downstream and fork PRs build without publishing.
+    # Only same-repository upstream PRs use its registry credentials.
     # Note: PR builds are x64-only for speed. Multi-arch builds happen on release.
-    - name: Build Holmes Docker image (fork PR - no push)
-      if: steps.fork_check.outputs.is_fork == 'true'
+    - name: Build Holmes Docker image (no registry push)
+      if: steps.registry.outputs.publish != 'true'
       uses: docker/build-push-action@v6
       with:
         context: .
@@ -222,8 +218,8 @@ jobs:
         cache-from: type=gha,scope=holmes
         cache-to: type=gha,mode=max,scope=holmes
 
-    - name: Build Holmes Operator Docker image (fork PR - no push)
-      if: steps.fork_check.outputs.is_fork == 'true'
+    - name: Build Holmes Operator Docker image (no registry push)
+      if: steps.registry.outputs.publish != 'true'
       uses: docker/build-push-action@v6
       with:
         context: .
@@ -234,7 +230,7 @@ jobs:
         cache-to: type=gha,mode=max,scope=operator
 
     - name: Build and push Holmes Docker image
-      if: steps.fork_check.outputs.is_fork != 'true'
+      if: steps.registry.outputs.publish == 'true'
       uses: docker/build-push-action@v6
       with:
         context: .
@@ -248,7 +244,7 @@ jobs:
         cache-to: type=gha,mode=max,scope=holmes
 
     - name: Build and push Holmes Operator Docker image
-      if: steps.fork_check.outputs.is_fork != 'true'
+      if: steps.registry.outputs.publish == 'true'
       uses: docker/build-push-action@v6
       with:
         context: .
@@ -262,7 +258,7 @@ jobs:
         cache-to: type=gha,mode=max,scope=operator
 
     - name: Print image locations
-      if: steps.fork_check.outputs.is_fork != 'true'
+      if: steps.registry.outputs.publish == 'true'
       run: |
         echo "Docker images pushed (x64 only):"
         echo "Holmes:"
@@ -273,7 +269,7 @@ jobs:
         echo "  us-central1-docker.pkg.dev/robusta-development/temporary-builds/holmes-operator:${{ steps.short_sha.outputs.sha_short }}"
 
     - name: Comment with image details
-      if: always() && steps.fork_check.outputs.is_fork != 'true'
+      if: always() && steps.registry.outputs.publish == 'true'
       uses: actions/github-script@v7
       with:
         script: |
