@@ -1,0 +1,72 @@
+name: 'Setup HolmesGPT Environment'
+description: 'Install Python, Poetry, kubectl and HolmesGPT dependencies'
+
+inputs:
+  python-version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  install-kubectl:
+    description: 'Whether to install kubectl'
+    required: false
+    default: 'true'
+  working-directory:
+    description: 'Working directory for poetry commands (where pyproject.toml is located)'
+    required: false
+    default: '.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Poetry
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip setuptools pyinstaller
+
+        # Install Poetry with specific version for consistency
+        curl -sSL https://install.python-poetry.org | python3 - --version 1.4.0
+
+        # Add Poetry to PATH
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+        # Use in-project virtualenv for efficient caching
+        $HOME/.local/bin/poetry config virtualenvs.in-project true
+
+    - name: Cache Python virtualenv
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.working-directory }}/.venv
+        key: venv-${{ inputs.python-version }}-${{ hashFiles(format('{0}/poetry.lock', inputs.working-directory)) }}
+
+    - name: Install uv (provides uvx for MCP stdio servers)
+      shell: bash
+      run: |
+        python -m pip install uv
+
+    - name: Install project dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        poetry install --no-root --with dev
+
+    - name: Add virtualenv to PATH
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
+
+    - name: Install kubectl
+      if: inputs.install-kubectl == 'true'
+      shell: bash
+      run: |
+        # Using hardcoded version to avoid failures when dl.k8s.io/release/stable.txt is unreachable
+        KUBECTL_VERSION="v1.35.0"
+        curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        kubectl version --client

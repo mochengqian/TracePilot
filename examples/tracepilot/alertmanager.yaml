@@ -1,0 +1,17 @@
+route:
+  receiver: tracepilot
+  group_by: [cluster, namespace, service, alertname]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 5m
+receivers:
+  - name: tracepilot
+    webhook_configs:
+      - url: https://tracepilot.example.test/api/v1/webhooks/alertmanager/prod
+        send_resolved: true
+        max_alerts: 100
+        timeout: 10s
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/secrets/tracepilot-token

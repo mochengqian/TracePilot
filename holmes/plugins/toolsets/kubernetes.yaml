@@ -1,0 +1,494 @@
+toolsets:
+  kubernetes/core:
+    expose_remotely: true  # cluster-local; callable cross-cluster via platform-mcp
+    description: "Read access to cluster resources (excluding secrets and other sensitive data)"
+    docs_url: "https://holmesgpt.dev/data-sources/builtin-toolsets/kubernetes/"
+    icon_url: "https://raw.githubusercontent.com/gilbarbara/logos/de2c1f96ff6e74ea7ea979b43202e8d4b863c655/logos/kubernetes.svg"
+    tags:
+      - core
+    prerequisites:
+      - command: "kubectl version --client"
+
+    # Note: Many tools in this toolset use transformers with llm_summarize
+    # to automatically summarize large kubectl outputs when a fast model is configured.
+    # This reduces context window usage while preserving key information for debugging.
+
+    tools:
+      - name: "kubernetes_jq_query"
+        user_description: "jq query: kubectl get {{kind}} | jq '{{jq_expr}}'"
+        description: >
+          Use kubectl to get json for all resources of a specific kind and filter with jq.
+          Prefer over bash for large queries - paginates via the Kubernetes API so large
+          clusters don't overflow context.
+          Returns a JSON object with keys: "total_items_processed", "matches_found",
+          "results" (array of matching resources), and "stderr" (error output or null).
+          The 'kind' parameter must be the plural form of the resource type
+          (e.g., "pods" not "pod", "jobs" not "job").
+          Do not worry about escaping the jq_expr - it will be done by the system.
+          Example: .items[] | .spec.containers[].image | select(test("^gcr.io/") | not)
+        script: |
+          #!/bin/bash
+
+          # SECURITY: assign sanitized params to shell variables in an unquoted
+          # assignment slot, then reference them only as "$VAR". Never interpolate
+          # {{ param }} inside a quoted context - sanitize() (shlex.quote) wraps
+          # dangerous values in single quotes, which are literal (and command
+          # substitution stays active) inside a double-quoted or single-quoted slot.
+          KIND={{ kind }}
+
+          # Collapse multi-line jq expressions (LLMs sometimes write multi-line jq)
+          # Note: use $'\n' syntax instead of '\n' because Jinja2 interprets \n as literal newlines
+          JQ_FILTER={{ jq_expr }}
+          JQ_FILTER=$(printf '%s' "$JQ_FILTER" | tr $'\n\r' '  ')
+
+          err_file=$(mktemp)
+
+          # Get the API path for the resource kind using kubectl
+          # Match the resource name (first column) as an EXACT string, not a
+          # grep regex - otherwise a kind like '.*' or 'a|b' would match the
+          # wrong resource. awk compares $1 literally and stops at the first hit.
+          API_INFO=$(kubectl api-resources --no-headers 2>>"$err_file" | awk -v kind="$KIND" '$1 == kind {print; exit}')
+
+          if [ -z "$API_INFO" ]; then
+            err_content=$(cat "$err_file" 2>/dev/null)
+            rm -f "$err_file"
+            jq -n --arg stderr "Unable to find resource kind '${KIND}'. $err_content" \
+              '{total_items_processed: 0, matches_found: 0, results: [], stderr: $stderr}'
+            exit 0
+          fi
+
+          # Extract NAMESPACED value
+          if [[ "$API_INFO" == *" true "* ]]; then
+            PREFIX=$(echo "$API_INFO" | sed 's/ true .*//')
+          elif [[ "$API_INFO" == *" false "* ]]; then
+            PREFIX=$(echo "$API_INFO" | sed 's/ false .*//')
+          else
+            err_content=$(cat "$err_file" 2>/dev/null)
+            rm -f "$err_file"
+            jq -n --arg stderr "Could not parse API info for '${KIND}'. $err_content" \
+              '{total_items_processed: 0, matches_found: 0, results: [], stderr: $stderr}'
+            exit 0
+          fi
+
+          # Trim trailing spaces from prefix and collapse internal spaces
+          PREFIX=$(echo "$PREFIX" | sed 's/  *$//' | sed 's/  */ /g')
+
+          IFS=' ' read -ra PREFIX_FIELDS <<< "$PREFIX"
+          FIELD_COUNT=0
+          for field in "${PREFIX_FIELDS[@]}"; do
+            ((FIELD_COUNT++))
+          done
+
+          RESOURCE_NAME="${PREFIX_FIELDS[0]}"
+          if [ $FIELD_COUNT -ge 2 ]; then
+            API_VERSION="${PREFIX_FIELDS[$((FIELD_COUNT - 1))]}"
+          else
+            API_VERSION=""
+          fi
+
+          if [ -z "$API_VERSION" ] || [ -z "$RESOURCE_NAME" ]; then
+            err_content=$(cat "$err_file" 2>/dev/null)
+            rm -f "$err_file"
+            jq -n --arg stderr "Unable to parse API info for resource kind '${KIND}'. $err_content" \
+              '{total_items_processed: 0, matches_found: 0, results: [], stderr: $stderr}'
+            exit 0
+          fi
+
+          # Build API path
+          if [[ "$API_VERSION" == "v1" ]]; then
+            API_PATH="/api/v1/${RESOURCE_NAME}"
+          else
+            API_PATH="/apis/${API_VERSION}/${RESOURCE_NAME}"
+          fi
+
+          # Process resources in chunks using API pagination
+          LIMIT=500
+          CONTINUE=""
+          PROCESSED=0
+          TOTAL_MATCHES=0
+          ALL_MATCHES=""
+
+          while true; do
+            if [ -z "$CONTINUE" ]; then
+              QUERY="${API_PATH}?limit=${LIMIT}"
+            else
+              QUERY="${API_PATH}?limit=${LIMIT}&continue=${CONTINUE}"
+            fi
+
+            OUTPUT=$(kubectl get --raw "$QUERY" 2>>"$err_file")
+            exit_code=$?
+
+            if [ $exit_code -ne 0 ]; then
+              err_content=$(cat "$err_file" 2>/dev/null)
+              rm -f "$err_file"
+              jq -n --arg stderr "kubectl get --raw failed for $QUERY. $err_content" \
+                --argjson total "$PROCESSED" \
+                '{total_items_processed: $total, matches_found: 0, results: [], stderr: $stderr}'
+              exit 0
+            fi
+
+            ITEMS_COUNT=$(echo "$OUTPUT" | jq '.items | length')
+
+            MATCHES=$(echo "$OUTPUT" | jq -c "$JQ_FILTER" 2>>"$err_file")
+            jq_exit=$?
+            if [ $jq_exit -ne 0 ]; then
+              err_content=$(cat "$err_file" 2>/dev/null)
+              rm -f "$err_file"
+              jq -n --arg stderr "jq expression failed. $err_content" \
+                --argjson total "$PROCESSED" \
+                '{total_items_processed: $total, matches_found: 0, results: [], stderr: $stderr}'
+              exit 0
+            fi
+
+            if [ "$ITEMS_COUNT" -gt 0 ]; then
+              if [ -n "$MATCHES" ]; then
+                if [ -z "$ALL_MATCHES" ]; then
+                  ALL_MATCHES="$MATCHES"
+                else
+                  ALL_MATCHES="$ALL_MATCHES"$'\n'"$MATCHES"
+                fi
+                MATCH_COUNT=$(echo "$MATCHES" | grep -c . || true)
+                TOTAL_MATCHES=$((TOTAL_MATCHES + MATCH_COUNT))
+              fi
+              PROCESSED=$((PROCESSED + ITEMS_COUNT))
+            fi
+
+            CONTINUE=$(echo "$OUTPUT" | jq -r '.metadata.continue // empty')
+
+            if [ -z "$CONTINUE" ]; then
+              break
+            fi
+          done
+
+          err_content=$(cat "$err_file" 2>/dev/null)
+          rm -f "$err_file"
+
+          # Output results as a JSON object with metadata
+          if [ -n "$ALL_MATCHES" ]; then
+            RESULTS=$(echo "$ALL_MATCHES" | jq -s '.')
+          else
+            RESULTS="[]"
+          fi
+
+          jq -n \
+            --argjson results "$RESULTS" \
+            --argjson total_items_processed "$PROCESSED" \
+            --argjson matches_found "$TOTAL_MATCHES" \
+            --arg stderr "$err_content" \
+            '{total_items_processed: $total_items_processed, matches_found: $matches_found, results: $results, stderr: (if $stderr == "" then null else $stderr end)}'
+        transformers:
+          - name: llm_summarize
+            config:
+              input_threshold: 10000
+              prompt: |
+                Summarize this jq query output focusing on:
+                - Key patterns and commonalities in the data
+                - Notable outliers, anomalies, or items that need attention
+                - Group similar results into aggregate descriptions when possible
+                - Highlight any empty results, null values, or missing data
+                - When applicable, mention specific resource names, namespaces, or values that stand out
+                - Organize findings in a structured way that helps with troubleshooting
+                - Be concise: aim for ≤ 50% of the original text; prioritize aggregates and actionable outliers
+                - Include grep-ready keys/values; avoid repeating entire objects or unchanged defaults
+
+      - name: "kubernetes_tabular_query"
+        user_description: "filter: kubectl get {{kind}} columns='{{columns}}'{% if filter_pattern %} filter={{filter_pattern}}{% endif %}"
+        description: >
+          Extract specific fields from Kubernetes resources in tabular format with optional filtering.
+          Returns a JSON object with keys: "count" (number of rows), "header" (column header line),
+          "rows" (array of data rows), and "stderr" (error output or null).
+          Only requested fields are transmitted, so it works well on large clusters.
+          Column specification format: HEADER:FIELD_PATH,HEADER2:FIELD_PATH2,...
+          e.g. NAME:.metadata.name,STATUS:.status.phase,IMAGE:.spec.containers[0].image
+          Optional filter_pattern matches any column (grep regex), e.g. filter_pattern="Running".
+
+          LIMITATIONS - not allowed characters in columns: ' / ; and newline.
+          Label keys containing dots or slashes (e.g. kubernetes.io/arch, app.kubernetes.io/name)
+          CANNOT be queried with this tool because dots are path separators in JSONPath and
+          slashes are forbidden characters. Use kubernetes_jq_query instead for labels with
+          special characters, e.g.: .items[] | {name: .metadata.name, arch: .metadata.labels["kubernetes.io/arch"]}
+          Similarly, use .status.nodeInfo.architecture instead of .metadata.labels["kubernetes.io/arch"] when possible.
+        script: |
+          #!/bin/bash
+          # SECURITY: assign sanitized params to shell variables (unquoted slot),
+          # then reference them only as "$VAR" - never interpolate {{ param }}
+          # inside a quoted context. See kubernetes_jq_query for the rationale.
+          KIND={{ kind }}
+          CUSTOM_COLUMNS={{ columns }}
+          err_file=$(mktemp)
+          output=$(kubectl get "$KIND" --all-namespaces -o custom-columns="$CUSTOM_COLUMNS" 2>"$err_file")
+          kubectl_exit=$?
+          err_content=$(cat "$err_file" 2>/dev/null)
+          rm -f "$err_file"
+
+          if [ $kubectl_exit -ne 0 ] || [ -z "$output" ]; then
+            if command -v jq &>/dev/null; then
+              jq -n --arg stderr "$err_content" '{count: 0, header: null, rows: [], stderr: $stderr}'
+            else
+              echo "=== STDERR ==="
+              echo "$err_content"
+              echo "=== ROWS ==="
+              echo "=== COUNT ==="
+              echo 0
+            fi
+            exit 0
+          fi
+
+          # Split header and data rows
+          header=$(echo "$output" | head -1)
+          {% if filter_pattern %}
+          FILTER_PATTERN={{ filter_pattern }}
+          data=$(echo "$output" | tail -n +2 | grep -E -- "$FILTER_PATTERN" || true)
+          {% else %}
+          data=$(echo "$output" | tail -n +2)
+          {% endif %}
+
+          if command -v jq &>/dev/null; then
+            if [ -n "$data" ]; then
+              rows=$(echo "$data" | jq -R . | jq -s '.')
+              count=$(echo "$data" | wc -l)
+            else
+              rows="[]"
+              count=0
+            fi
+            jq -n \
+              --argjson count "$count" \
+              --arg header "$header" \
+              --argjson rows "$rows" \
+              --arg stderr "$err_content" \
+              '{count: $count, header: $header, rows: $rows, stderr: (if $stderr == "" then null else $stderr end)}'
+          else
+            echo "=== STDERR ==="
+            echo "$err_content"
+            echo "=== HEADER ==="
+            echo "$header"
+            echo "=== ROWS ==="
+            echo "$data"
+            echo "=== COUNT ==="
+            if [ -n "$data" ]; then echo "$data" | wc -l; else echo 0; fi
+          fi
+        transformers:
+          - name: llm_summarize
+            config:
+              input_threshold: 10000
+              prompt: |
+                Summarize this tabular output focusing on:
+                - Key patterns and trends in the data
+                - Resources that need attention (errors, pending, failures)
+                - Group similar items into aggregate descriptions
+                - Highlight outliers or unusual values
+                - Mention specific resource names only for problematic items
+                - Provide counts and distributions where relevant
+                - Be concise: aim for ≤ 50% of the original size
+                - Keep output actionable and focused on anomalies
+
+      - name: "kubernetes_count"
+        user_description: "count: kubectl get {{kind}} | jq '{{jq_expr}}'"
+        description: >
+          Use kubectl to apply a jq filter and then count the results.
+          Use this whenever asked to count kubernetes resources.
+          Prefer over bash for large queries - paginates via the Kubernetes API so large
+          clusters don't overflow context.
+          Returns a JSON object with keys: "total_items_processed", "matches_found" (number of matches),
+          "preview" (first 10 results truncated to 200 chars), and "stderr" (error output or null).
+          The 'kind' parameter must be the plural form of the resource type ("pods" not "pod").
+          Use select() to filter objects before extracting properties; do not worry about escaping
+          the jq_expr - it will be done by the system.
+          e.g. .items[] | select(.spec.containers[].image | test("^gcr.io/") | not) | .metadata.name
+        script: |
+          #!/bin/bash
+
+          # SECURITY: assign sanitized params to shell variables (unquoted slot),
+          # then reference them only as "$VAR" - never interpolate {{ param }}
+          # inside a quoted context. See kubernetes_jq_query for the rationale.
+          KIND={{ kind }}
+
+          err_file=$(mktemp)
+
+          # Get the API path for the resource kind
+          # Match the resource name (first column) as an EXACT string, not a
+          # grep regex - otherwise a kind like '.*' or 'a|b' would match the
+          # wrong resource. awk compares $1 literally and stops at the first hit.
+          API_INFO=$(kubectl api-resources --no-headers 2>>"$err_file" | awk -v kind="$KIND" '$1 == kind {print; exit}')
+
+          if [ -z "$API_INFO" ]; then
+            err_content=$(cat "$err_file" 2>/dev/null)
+            rm -f "$err_file"
+            jq -n --arg stderr "Unable to find resource kind '${KIND}'. $err_content" \
+              '{total_items_processed: 0, matches_found: 0, preview: [], stderr: $stderr}'
+            exit 0
+          fi
+
+          if [[ "$API_INFO" == *" true "* ]]; then
+            PREFIX=$(echo "$API_INFO" | sed 's/ true .*//')
+          elif [[ "$API_INFO" == *" false "* ]]; then
+            PREFIX=$(echo "$API_INFO" | sed 's/ false .*//')
+          else
+            err_content=$(cat "$err_file" 2>/dev/null)
+            rm -f "$err_file"
+            jq -n --arg stderr "Could not parse API info for '${KIND}'. $err_content" \
+              '{total_items_processed: 0, matches_found: 0, preview: [], stderr: $stderr}'
+            exit 0
+          fi
+
+          PREFIX=$(echo "$PREFIX" | sed 's/  *$//' | sed 's/  */ /g')
+
+          IFS=' ' read -ra PREFIX_FIELDS <<< "$PREFIX"
+          FIELD_COUNT=0
+          for field in "${PREFIX_FIELDS[@]}"; do
+            ((FIELD_COUNT++))
+          done
+          RESOURCE_NAME="${PREFIX_FIELDS[0]}"
+
+          if [ $FIELD_COUNT -ge 2 ]; then
+            API_VERSION="${PREFIX_FIELDS[$((FIELD_COUNT - 1))]}"
+          else
+            API_VERSION=""
+          fi
+
+          if [ -z "$API_VERSION" ] || [ -z "$RESOURCE_NAME" ]; then
+            err_content=$(cat "$err_file" 2>/dev/null)
+            rm -f "$err_file"
+            jq -n --arg stderr "Unable to parse API info for resource kind '${KIND}'. $err_content" \
+              '{total_items_processed: 0, matches_found: 0, preview: [], stderr: $stderr}'
+            exit 0
+          fi
+
+          # Build API path
+          if [[ "$API_VERSION" == "v1" ]]; then
+            API_PATH="/api/v1/${RESOURCE_NAME}"
+          else
+            API_PATH="/apis/${API_VERSION}/${RESOURCE_NAME}"
+          fi
+
+          # Process resources in chunks using API pagination
+          LIMIT=500
+          CONTINUE=""
+          ALL_MATCHES=""
+          TOTAL_PROCESSED=0
+
+          while true; do
+            if [ -z "$CONTINUE" ]; then
+              QUERY="${API_PATH}?limit=${LIMIT}"
+            else
+              QUERY="${API_PATH}?limit=${LIMIT}&continue=${CONTINUE}"
+            fi
+
+            OUTPUT=$(kubectl get --raw "$QUERY" 2>>"$err_file")
+            exit_code=$?
+
+            if [ $exit_code -ne 0 ]; then
+              err_content=$(cat "$err_file" 2>/dev/null)
+              rm -f "$err_file"
+              jq -n --arg stderr "kubectl get --raw failed for $QUERY. $err_content" \
+                --argjson total "$TOTAL_PROCESSED" \
+                '{total_items_processed: $total, matches_found: 0, preview: [], stderr: $stderr}'
+              exit 0
+            fi
+
+            ITEMS_COUNT=$(echo "$OUTPUT" | jq '.items | length')
+            TOTAL_PROCESSED=$((TOTAL_PROCESSED + ITEMS_COUNT))
+
+            BATCH_MATCHES=$(echo "$OUTPUT" | jq -c -r {{ jq_expr }} 2>>"$err_file")
+            jq_exit=$?
+            if [ $jq_exit -ne 0 ]; then
+              err_content=$(cat "$err_file" 2>/dev/null)
+              rm -f "$err_file"
+              jq -n --arg stderr "jq expression failed. $err_content" \
+                --argjson total "$TOTAL_PROCESSED" \
+                '{total_items_processed: $total, matches_found: 0, preview: [], stderr: $stderr}'
+              exit 0
+            fi
+
+            if [ -n "$BATCH_MATCHES" ]; then
+              if [ -z "$ALL_MATCHES" ]; then
+                ALL_MATCHES="$BATCH_MATCHES"
+              else
+                ALL_MATCHES="$ALL_MATCHES"$'\n'"$BATCH_MATCHES"
+              fi
+            fi
+
+            CONTINUE=$(echo "$OUTPUT" | jq -r '.metadata.continue // empty')
+            if [ -z "$CONTINUE" ]; then
+              break
+            fi
+          done
+
+          err_content=$(cat "$err_file" 2>/dev/null)
+          rm -f "$err_file"
+
+          # Count and preview the collected matches
+          filtered_matches=$(echo "$ALL_MATCHES" | grep -v '^$' | grep -v '^null$')
+          if [ -z "$filtered_matches" ]; then
+            MATCHES_FOUND=0
+            PREVIEW="[]"
+          else
+            MATCHES_FOUND=$(echo "$filtered_matches" | wc -l)
+            PREVIEW=$(echo "$filtered_matches" | head -n 10 | cut -c 1-200 | jq -R . | jq -s '.')
+          fi
+
+          jq -n \
+            --argjson matches_found "$MATCHES_FOUND" \
+            --argjson preview "$PREVIEW" \
+            --argjson total_items_processed "$TOTAL_PROCESSED" \
+            --arg stderr "$err_content" \
+            '{total_items_processed: $total_items_processed, matches_found: $matches_found, preview: $preview, stderr: (if $stderr == "" then null else $stderr end)}'
+
+    # NOTE: this is only possible for probes with a healthz endpoint - we do this to avoid giving the LLM generic
+    # http GET capabilities which are more powerful than we want to expose
+    #- name: "check_liveness_probe"
+    #  description: "Run an http Kubernetes liveness probe for a given pod and return the results. Can be used to troubleshoot previous failures of the same probe assuming they fail now in the same manner."
+    #  command: "kubectl get --raw '/api/v1/namespaces/{{pod_namespace}}/pods/{{pod_name}}:{{liveness_probe_port}}/healthz'"
+
+    #- name: "kubectl_debug_node"
+    #  description: "Run a command on a Kubernetes node"
+    #  command: "kubectl debug node/mynode --image=ubuntu"
+
+    #- name: "healthcheck_plugin"
+    #  description: "Check why a kubernetes health probe is failing. First call get_healthcheck_details"
+    #  command: "kubectl exec -n {{namespace}} {{ pod_name }} -- wget {{ url }}:{{port}}"
+
+    # try adding your own tools here!
+    # e.g. to query company-specific data or run your own commands
+
+  kubernetes/live-metrics:
+    description: "Provides real-time metrics for pods and nodes"
+    docs_url: "https://holmesgpt.dev/data-sources/builtin-toolsets/kubernetes/"
+    icon_url: "https://raw.githubusercontent.com/gilbarbara/logos/de2c1f96ff6e74ea7ea979b43202e8d4b863c655/logos/kubernetes.svg"
+    llm_instructions: |
+      The kubectl_top_pods or kubectl_top_nodes do not return time series data or metrics that can be used for graphs
+      Do NOT use kubectl_top_pods or kubectl_top_nodes for graph generation - it only shows current snapshot data
+      kubectl_top_pods or kubectl_top_nodes are for current status checks, not historical graphs
+    tags:
+      - core
+    prerequisites:
+      - command: "kubectl top nodes"
+    tools:
+      - name: "kubectl_top_pods"
+        description: "Retrieves real-time CPU and memory usage for each pod in the cluster."
+        command: >
+          kubectl top pods -A
+      - name: "kubectl_top_nodes"
+        description: "Retrieves real-time CPU and memory usage for each node in the cluster."
+        command: >
+          kubectl top nodes
+
+  kubernetes/kube-prometheus-stack:
+    description: "Fetches prometheus definition"
+    docs_url: "https://holmesgpt.dev/data-sources/builtin-toolsets/kubernetes/"
+    icon_url: "https://raw.githubusercontent.com/gilbarbara/logos/de2c1f96ff6e74ea7ea979b43202e8d4b863c655/logos/kubernetes.svg"
+    tags:
+      - core
+    tools:
+      - name: "get_prometheus_target"
+        description: "Fetch the definition of a Prometheus target"
+        script: |
+          #!/bin/bash
+          # SECURITY: assign sanitized params to shell variables (unquoted slot),
+          # then reference them only as "$VAR". Pass target_name into jq via
+          # --arg so it is never interpolated into the jq program text.
+          PROM_NAMESPACE={{ prometheus_namespace }}
+          PROM_SERVICE={{ prometheus_service_name }}
+          TARGET_NAME={{ target_name }}
+          kubectl get --raw "/api/v1/namespaces/${PROM_NAMESPACE}/services/${PROM_SERVICE}:9090/proxy/api/v1/targets" \
+            | jq --arg target "$TARGET_NAME" '.data.activeTargets[] | select(.labels.job == $target)'

@@ -1,0 +1,255 @@
+import logging
+from dataclasses import dataclass
+from typing import List, Optional, Union
+
+import openai
+from autoevals import LLMClassifier, init
+from braintrust import Span, SpanTypeAttribute
+from braintrust.oai import wrap_openai
+
+from tests.llm.utils.test_case_utils import _model_list_exists, create_eval_llm
+from tests.llm.utils.test_env_vars import (
+    AZURE_API_BASE,
+    AZURE_API_KEY,
+    AZURE_API_VERSION,
+    CLASSIFIER_MODEL,
+    OPENAI_API_BASE,
+    OPENAI_API_KEY,
+    OPENROUTER_API_BASE,
+    OPENROUTER_API_KEY,
+)
+
+
+@dataclass
+class ClassifierModelParams:
+    model: str
+    api_key: Optional[str]
+    api_base: Optional[str]
+    api_version: Optional[str]
+
+    @property
+    def is_azure(self) -> bool:
+        return bool(self.api_base and self.api_version)
+
+
+def get_classifier_model_params() -> ClassifierModelParams:
+    """Get classifier model parameters from model list or environment variables."""
+    if _model_list_exists():
+        llm = create_eval_llm(CLASSIFIER_MODEL)
+        model_for_api = llm.model
+        client_api_key = llm.api_key
+        client_base_url = llm.api_base
+        client_api_version = llm.api_version
+
+        # The classifier talks to OpenAI/OpenRouter directly via the openai SDK
+        # (autoevals doesn't go through litellm), so litellm-style provider
+        # prefixes in the model name must be stripped before we send the call.
+        if model_for_api and model_for_api.startswith("openrouter/"):
+            model_for_api = model_for_api.split("/", 1)[1]
+            # Fall back to OpenRouter's public endpoint if model_list didn't pin one.
+            if not client_base_url:
+                client_base_url = (
+                    OPENROUTER_API_BASE or "https://openrouter.ai/api/v1"
+                )
+    else:
+        if not OPENAI_API_KEY and not AZURE_API_KEY and not OPENROUTER_API_KEY:
+            raise ValueError(
+                "No API key found (AZURE_API_KEY, OPENAI_API_KEY, or OPENROUTER_API_KEY)"
+            )
+        model_for_api = CLASSIFIER_MODEL
+        if AZURE_API_BASE:
+            client_api_key = AZURE_API_KEY
+            client_base_url = AZURE_API_BASE
+        elif OPENAI_API_KEY:
+            client_api_key = OPENAI_API_KEY
+            client_base_url = OPENAI_API_BASE
+        elif OPENROUTER_API_KEY:
+            client_api_key = OPENROUTER_API_KEY
+            client_base_url = OPENROUTER_API_BASE or "https://openrouter.ai/api/v1"
+        else:
+            raise ValueError(
+                "No API key found (AZURE_API_KEY, OPENAI_API_KEY, or OPENROUTER_API_KEY)"
+            )
+        client_api_version = AZURE_API_VERSION
+
+        # Strip provider prefixes for API calls
+        if AZURE_API_BASE and CLASSIFIER_MODEL.startswith("azure/"):
+            if len(CLASSIFIER_MODEL.split("/")) != 2:
+                raise ValueError(
+                    f"Current classifier model '{CLASSIFIER_MODEL}' does not meet the pattern 'azure/<deployment-name>' when using Azure AI Foundry."
+                )
+            model_for_api = CLASSIFIER_MODEL.split("/", 1)[1]
+        elif CLASSIFIER_MODEL.startswith("openrouter/"):
+            # Strip "openrouter/" prefix - OpenRouter expects "openai/gpt-4.1" not "openrouter/openai/gpt-4.1"
+            model_for_api = CLASSIFIER_MODEL.split("/", 1)[1]
+
+    return ClassifierModelParams(
+        model=model_for_api,
+        api_key=client_api_key,
+        api_base=client_base_url,
+        api_version=client_api_version,
+    )
+
+
+classifier_model = CLASSIFIER_MODEL
+
+
+def create_llm_client():
+    """Create OpenAI/Azure client with same logic used by tests"""
+    params = get_classifier_model_params()
+
+    if params.is_azure:
+        deployment = (
+            params.model.split("/", 1)[1] if "/" in params.model else params.model
+        )
+        if not params.api_key:
+            raise ValueError("No AZURE_API_KEY")
+        client = openai.AzureOpenAI(
+            azure_endpoint=params.api_base,
+            azure_deployment=deployment,
+            api_version=params.api_version,
+            api_key=params.api_key,
+        )
+        model_for_api = deployment
+    else:
+        if not params.api_key:
+            raise ValueError("No OPENAI_API_KEY or OPENROUTER_API_KEY")
+        client = openai.OpenAI(api_key=params.api_key, base_url=params.api_base)
+        model_for_api = params.model
+
+    return client, model_for_api
+
+
+# Register client with autoevals
+try:
+    client, _ = create_llm_client()
+    params = get_classifier_model_params()
+    if params.is_azure:
+        wrapped = wrap_openai(client)
+        init(wrapped)  # type: ignore
+except Exception:
+    # If client creation fails, individual tests will be skipped due to the fixture, so client = None is OK
+    client = None
+
+
+def evaluate_correctness(
+    expected_elements: Union[str, List[str]],
+    output: Optional[str],
+    parent_span: Optional[Span],
+    caplog,
+    evaluation_type: str = "strict",
+):
+    expected_elements_str = "\n- ".join(expected_elements)
+
+    caplog.set_level("INFO", logger="classifier")
+    logger = logging.getLogger("classifier")
+
+    if isinstance(expected_elements, str):
+        expected_elements = [expected_elements]
+    expected_elements_str = "\n- ".join(expected_elements)
+
+    prompt_prefix = """
+You are evaluating the correctness of an OUTPUT given by a LLM. You must return a score that
+represents the correctness of that OUTPUT.
+
+The correctness is defined by the presence of EXPECTED ELEMENTS in the OUTPUT.
+Make a judgement call whether each ELEMENT sufficiently matches the OUTPUT. ELEMENTS do
+not need to appear verbatim or be a perfect match but their essence should be
+present in the whole OUTPUT, even if it spans multiple sentences.
+
+# EXPECTED ELEMENTS
+
+- {{expected}}
+
+# OUTPUT
+
+{{output}}
+
+
+Return a choice based on the number of EXPECTED ELEMENTS present in the OUTPUT.
+Possible choices:
+- A: All elements are presents
+- B: Either no element is present or only some but not all elements are present
+"""
+
+    if evaluation_type == "loose":
+        prompt_prefix = """
+You are evaluating the correctness of an OUTPUT given by a LLM. You must return a score that
+represents the correctness of that OUTPUT.
+
+The correctness is defined by the presence of EXPECTED in the OUTPUT.
+Make a judgement call whether each ELEMENT sufficiently matches the OUTPUT. ELEMENTS do
+not need to appear verbatim or be a perfect match but their essence should be
+present in the whole OUTPUT, even if it spans multiple sentences.
+
+# EXPECTED
+
+{{expected}}
+
+# OUTPUT
+
+{{output}}
+
+
+Return a choice based on the number of EXPECTED presence in the OUTPUT.
+Possible choices:
+- A: The OUTPUT reasonably matches the EXPECTED content
+- B: The OUTPUT does not match the EXPECTED content
+"""
+    params = get_classifier_model_params()
+    if params.is_azure:
+        logger.info(
+            f"Evaluating correctness with Azure AI Foundry; base_url={params.api_base}, api_version={params.api_version}, model={params.model}, api_key ending with: {params.api_key[-4:] if params.api_key else None}"
+        )
+        logger.info(
+            "To use OpenAI instead, unset the environment variable AZURE_API_BASE"
+        )
+    else:
+        logger.info(
+            f"Evaluating correctness with OpenAI; model={params.model}, api_key ending with: {params.api_key[-4:] if params.api_key else None}"
+        )
+        logger.info(
+            "To use Azure AI Foundry instead, set the environment variables AZURE_API_BASE, AZURE_API_VERSION, and AZURE_API_KEY"
+        )
+
+    classifier = LLMClassifier(
+        name="Correctness",
+        prompt_template=prompt_prefix,
+        choice_scores={"A": 1, "B": 0},
+        use_cot=True,
+        # With use_cot the judge writes its rationale inside the same JSON
+        # tool call as the choice. autoevals' default max_tokens=512 truncates
+        # that JSON on long rationales (large evaluation outputs like
+        # 95_skill_memory_leak_detection), crashing scoring with
+        # JSONDecodeError before any metric is recorded. Set the limit far
+        # above any realistic rationale length so truncation cannot happen.
+        max_tokens=16384,
+        model=params.model,
+        api_key=params.api_key if not params.is_azure else None,
+        base_url=params.api_base if not params.is_azure else None,
+        api_version=params.api_version if not params.is_azure else None,
+    )
+    if parent_span:
+        with parent_span.start_span(
+            name="Correctness", type=SpanTypeAttribute.SCORE
+        ) as span:
+            correctness_eval = classifier(
+                input=prompt_prefix, output=output or "", expected=expected_elements_str
+            )
+
+            span.log(
+                input=prompt_prefix,
+                output=correctness_eval.metadata.get("rationale", ""),
+                expected=expected_elements_str,
+                scores={
+                    "correctness": correctness_eval.score,
+                },
+                metadata=correctness_eval.metadata,
+            )
+            return correctness_eval
+    else:
+        return classifier(
+            input=prompt_prefix, output=output or "", expected=expected_elements_str
+        )
+
+

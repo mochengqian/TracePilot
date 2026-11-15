@@ -1,0 +1,73 @@
+toolsets:
+  argocd/core:
+    description: "Set of tools to get argocd metadata like list of apps, repositories, projects, etc."
+    docs_url: "https://holmesgpt.dev/data-sources/builtin-toolsets/argocd/"
+    icon_url: "https://raw.githubusercontent.com/gilbarbara/logos/de2c1f96ff6e74ea7ea979b43202e8d4b863c655/logos/argo.svg"
+    llm_instructions: |
+      You have access to a set of ArgoCD tools for debugging Kubernetes application deployments.
+      If an application's name does not exist in kubernetes, it may exist in argocd: call the tool `argocd_app_list` to find it.
+      IMPORTANT: If you are asked about health issues, ALWAYS check if the argo cd apps are in a healthy state.
+      If some resource is out of sync, ALWAYS show the diff, using the argocd_app_diff tool, between the desired state and the current state.
+      These tools help you investigate issues with GitOps-managed applications in your Kubernetes clusters.
+      In addition to the general investigation steps, ALWAYS follow these steps as well:
+        1. List the applications
+        2. Retrieve the application status and its config
+        3. Retrieve the application's manifests for issues
+        4. Compare the ArgoCD config with the kubernetes status using kubectl tools
+        5. Check for resources mismatch between argocd and kubernetes
+        6. If an application is OutOfSync, pull the diff using the argocd_app_diff tool
+      {% if tool_names|list|length > 0 %}
+      The following commands are available to introspect into ArgoCD: {{ ", ".join(tool_names) }}
+      {% endif %}
+      ALWAYS compare the argocd deployment with kubernetes so that you can suggest better solutions to the user.
+      DO NOT tell the user to check if a resource exists or to update the configuration without being specific, DO checks yourself on behalf of the user and then tell them the solution.
+    tags:
+      - core
+    prerequisites:
+      - command: "argocd version"
+      - env:
+          - ARGOCD_AUTH_TOKEN
+    tools:
+      - name: "argocd_app_list"
+        description: "List the applications in Argocd"
+        command: "argocd app list"
+
+      - name: "argocd_app_get"
+        description: "Retrieve information about an existing application, such as its status and configuration"
+        command: "argocd app get {{ app_name }} --show-operation -o wide"
+
+      - name: "argocd_app_diff"
+        description: "Display the differences between the current state of an application and the desired state specified in its Git repository"
+        command: "argocd app diff {{ app_name }}"
+
+      - name: "argocd_app_manifests"
+        description: "Retrieve manifests for an application"
+        command: "argocd app manifests {{app_name}}"
+
+      - name: "argocd_app_resources"
+        description: "List resources of application"
+        command: "argocd app resources {{app_name}}"
+
+      - name: "argocd_app_manifest_source_revision"
+        description: "Get manifests for a multi-source application at specific revision for specific source"
+        command: "argocd app manifests {{app_name}}{% if revision %} --revision {{ revision }}{% endif %}{% if source %} --source {{ source }}{% endif %}"
+
+      - name: "argocd_app_history"
+        description: "List the deployment history of an application in ArgoCD"
+        command: "argocd app history {{app_name}} --app-namespace {{namespace}}"
+
+      - name: "argocd_repo_list"
+        description: "List all the Git repositories that ArgoCD is currently managing"
+        command: "argocd repo list"
+
+      - name: "argocd_proj_list"
+        description: "List all available projects"
+        command: "argocd proj list"
+
+      - name: "argocd_proj_get"
+        description: "Retrieves information about an existing project, such as its applications and policies"
+        command: "argocd proj get {{ project_name }}"
+
+      - name: "argocd_cluster_list"
+        description: "List all known clusters"
+        command: "argocd cluster list"

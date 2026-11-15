@@ -1,0 +1,30 @@
+# Live inference + real read-only MCP. Paths are relative to this file.
+database_url_env: TRACEPILOT_DATABASE_URL
+lease_seconds: 60
+sources:
+  prod:
+    tenant_id: trade-team
+    source_group: prometheus-prod
+    cluster: prod-a
+    token_env: TRACEPILOT_ALERT_TOKEN
+    agent_config: observability.yaml
+    namespaces: [trade]
+    services: [order, inventory]
+    dependencies:
+      order: [inventory]
+    service_aliases:
+      order-service: order
+    correlation_labels: [alertname, pod]
+    correlation_window_seconds: 900
+    lookback_seconds: 300
+    max_window_seconds: 3600
+    budget:
+      max_steps: 20
+      max_tool_calls: 10
+      max_reasoning_calls: 5
+      max_seconds: 300
+      max_parallel_tools: 3
+principals:
+  oncall:
+    tenant_id: trade-team
+    token_env: TRACEPILOT_API_TOKEN

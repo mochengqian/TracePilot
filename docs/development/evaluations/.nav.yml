@@ -1,0 +1,9 @@
+nav:
+  - index.md
+  - Latest Results: latest-results.md
+  - Recommendations: model-comparison-summary-20260315.md
+  - History: history
+  - Running Evaluations: running-evals.md
+  - Adding New Evaluations: adding-evals.md
+  - Benchmarking New Models: benchmarking-new-models.md
+  - Reporting with Braintrust: reporting.md

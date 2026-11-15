@@ -1,0 +1,12 @@
+toolsets:
+  kubernetes/core:
+    enabled: false
+  kubernetes/logs:
+    enabled: true
+  bash:
+    enabled: true
+    config:
+      builtin_allowlist: "extended"
+      deny:
+        - "kubectl get secret"
+        - "kubectl describe secret"

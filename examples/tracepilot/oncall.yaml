@@ -1,0 +1,25 @@
+# Explicit offline simulation: no model or monitoring API is called.
+database_url_env: TRACEPILOT_DATABASE_URL
+lease_seconds: 60
+poll_seconds: 1
+input_wait_seconds: 3600
+sources:
+  demo:
+    tenant_id: demo-team
+    source_group: alertmanager-demo
+    cluster: demo-cluster
+    token_env: TRACEPILOT_ALERT_TOKEN
+    demo_scenario: db-pool
+    namespaces: [demo]
+    services: [checkout]
+    correlation_labels: [alertname, pod]
+    budget:
+      max_steps: 20
+      max_tool_calls: 10
+      max_reasoning_calls: 5
+      max_seconds: 300
+      max_parallel_tools: 1
+principals:
+  oncall:
+    tenant_id: demo-team
+    token_env: TRACEPILOT_API_TOKEN

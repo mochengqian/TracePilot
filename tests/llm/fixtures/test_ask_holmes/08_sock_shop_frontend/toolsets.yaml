@@ -1,0 +1,7 @@
+toolsets:
+  prometheus/metrics:
+    enabled: False
+  kubernetes/logs:
+    enabled: true
+  kubernetes/core:
+    enabled: true

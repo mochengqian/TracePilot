@@ -1,0 +1,1865 @@
+import base64
+import binascii
+import gzip
+import json
+import logging
+import os
+import ssl
+import threading
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+from urllib.request import getproxies, proxy_bypass
+from uuid import uuid4
+
+import httpx
+import sentry_sdk
+import yaml  # type: ignore
+from cachetools import TTLCache  # type: ignore
+from postgrest._sync import request_builder as supabase_request_builder
+from postgrest._sync.request_builder import SyncQueryRequestBuilder
+from postgrest.base_request_builder import QueryArgs
+from postgrest.exceptions import APIError as PGAPIError
+from postgrest.types import ReturnMethod
+from pydantic import BaseModel, ValidationError
+from supabase import create_client
+from supabase.lib.client_options import SyncClientOptions as ClientOptions
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from holmes.clients.robusta_client import fetch_supabase_api_key
+from holmes.common.env_vars import (
+    ROBUSTA_ACCOUNT_ID,
+    ROBUSTA_CONFIG_PATH,
+    STORE_API_KEY,
+    STORE_EMAIL,
+    STORE_PASSWORD,
+    STORE_URL,
+)
+from holmes.core.resource_instruction import (
+    ResourceInstructionDocument,
+    ResourceInstructions,
+)
+from holmes.core.truncation.dal_truncation_utils import (
+    truncate_evidences_entities_if_necessary,
+)
+from holmes.plugins.skills import RobustaSkillInstruction
+from holmes.plugins.skills.skill_loader import (
+    DEFAULT_HIERARCHY_ORDER,
+    SkillHierarchyConfig,
+)
+from holmes.utils.definitions import RobustaConfig
+from holmes.utils.env import get_env_replacement
+from holmes.utils.global_instructions import Instructions
+
+if TYPE_CHECKING:
+    # Forward reference only — `usage_recorder` already TYPE_CHECKING-imports
+    # this module, so importing the other direction at runtime would close
+    # the cycle. We just need the name for the parameter annotation.
+    from holmes.core.usage_recorder import UsageRecorderState
+
+SUPABASE_TIMEOUT_SECONDS = int(os.getenv("SUPABASE_TIMEOUT_SECONDS", 60))
+
+# Maximum total rows to fetch from KRR scans, regardless of number of clusters
+# This prevents unbounded fetches when querying many clusters
+ISSUES_TABLE = "Issues"
+GROUPED_ISSUES_TABLE = "GroupedIssues"
+EVIDENCE_TABLE = "Evidence"
+RUNBOOKS_TABLE = "HolmesRunbooks"
+SESSION_TOKENS_TABLE = "AuthTokens"
+HOLMES_STATUS_TABLE = "HolmesStatus"
+HOLMES_TOOLSET = "HolmesToolsStatus"
+HOLMES_CUSTOM_SKILLS_TABLE = "HolmesCustomSkills"
+ACCOUNT_SETTINGS_TABLE = "AccountSettings"
+PERSONAL_RUNBOOK_CATALOG = "PersonalRunbookCatalog"
+SCANS_META_TABLE = "ScansMeta"
+SCANS_RESULTS_TABLE = "ScansResults"
+SCHEDULED_PROMPTS_RUNS_TABLE = "ScheduledPromptsRuns"
+HOLMES_RESULTS_TABLE = "HolmesResults"
+CONVERSATIONS_TABLE = "Conversations"
+CONVERSATION_EVENTS_TABLE = "ConversationEvents"
+OAUTH_TOKENS_TABLE = "OAuthTokens"
+HOLMES_USAGE_EVENTS_TABLE = "HolmesUsageEvents"
+
+ENRICHMENT_BLACKLIST = ["text_file", "graph", "ai_analysis", "holmes"]
+ENRICHMENT_BLACKLIST_SET = set(ENRICHMENT_BLACKLIST)
+
+
+logging.getLogger(__name__).debug("Patching supabase_request_builder.pre_select")
+original_pre_select = supabase_request_builder.pre_select
+
+
+def pre_select_patched(*args, **kwargs):
+    query_args: QueryArgs = original_pre_select(*args, **kwargs)
+    if not query_args.json:
+        query_args = QueryArgs(
+            query_args.method, query_args.params, query_args.headers, None
+        )
+
+    return query_args
+
+
+supabase_request_builder.pre_select = pre_select_patched
+
+
+class RunStatus(str, Enum):
+    PENDING = "pending"
+    PULLED = "pulled"
+    RUNNING = "running"
+    FAILED = "failed"
+    FAILED_NO_RETRY = "failed_no_retry"
+    COMPLETED = "completed"
+
+
+class _RemoteToolResultRejected(Exception):
+    """The post_remote_tool_call_result RPC rejected the write because the row
+    was reassigned, stopped, or already finished (first result wins). Terminal —
+    excluded from tenacity retry, since retrying cannot help."""
+
+
+class RobustaToken(BaseModel):
+    store_url: str
+    api_key: str
+    account_id: str
+    email: str
+    password: str
+
+
+# Troubleshooting guide for an outbound firewall blocking egress to the Robusta
+# platform (surfaces as a connection reset during sign-in). Linked from the log
+# and exception so users can find the fix.
+FIREWALL_TROUBLESHOOTING_URL = (
+    "https://holmesgpt.dev/reference/troubleshooting/#firewall-blocking-robusta-platform"
+)
+
+
+class SupabaseDnsException(Exception):
+    def __init__(self, error: Exception, url: str):
+        message = (
+            f"\n{error.__class__.__name__}: {error}\n"
+            f"Error connecting to <{url}>\n"
+            "This is often due to DNS issues or firewall policies - to troubleshoot run in your cluster:\n"
+            f"curl -I {url}\n"
+        )
+        super().__init__(message)
+
+
+class SupabaseConnectionException(Exception):
+    """Raised when Holmes cannot open a connection to the Robusta platform.
+
+    Almost always an outbound firewall / egress policy blocking traffic to the
+    Robusta platform (not a DNS or TLS certificate problem). The actionable
+    guidance - allowlist '*.robusta.dev' plus the docs link - is logged at
+    WARNING right before this is raised, so the exception message itself stays a
+    thin technical wrapper around the underlying connection error.
+    """
+
+    def __init__(self, error: Exception, url: str):
+        super().__init__(
+            f"Could not connect to the Robusta platform at {url} "
+            f"({error.__class__.__name__}: {error})"
+        )
+
+
+_DISCONNECT_RETRY_ATTEMPTS = 3
+
+
+def _log_remote_protocol_retry(retry_state: RetryCallState) -> None:
+    """Log each RemoteProtocolError retry. ``handle_request`` is decorated, so its
+    request is the second positional arg (``self`` is the first)."""
+    request = retry_state.args[1] if len(retry_state.args) > 1 else None
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    logging.warning(
+        "Supabase request %s %s hit RemoteProtocolError (%s); "
+        "retrying on a fresh connection (attempt %d/%d)",
+        getattr(request, "method", "?"),
+        getattr(request, "url", "?"),
+        exc,
+        retry_state.attempt_number,
+        _DISCONNECT_RETRY_ATTEMPTS,
+    )
+
+
+class SupabaseRetryTransport(httpx.HTTPTransport):
+    """HTTP/1.1 transport that retries transient ``RemoteProtocolError``s.
+
+    Two problems are fixed at this transport, so every Supabase sub-client
+    (postgrest, auth/gotrue, storage, realtime) is hardened uniformly rather
+    than just postgrest table queries:
+
+    1. ``http2=False`` — httpcore's *sync* HTTP/2 connection is not thread-safe,
+       and one ``SupabaseDal`` client is shared across the conversation worker,
+       realtime callbacks and request threads. HTTP/1.1 gives each concurrent
+       request its own pooled, thread-safe connection.
+    2. Retry on ``RemoteProtocolError`` — even on HTTP/1.1, Supabase's edge
+       (Cloudflare / Kong / load balancer) closes idle keep-alive connections
+       server-side. A pooled connection the edge has already closed gets reused
+       and the next request fails with ``RemoteProtocolError: Server
+       disconnected without sending a response`` *before* it reaches Supabase.
+       The request was never processed, so retrying it on a fresh connection is
+       safe (postgrest/auth/storage bodies are buffered bytes, hence replayable).
+
+    This is the hardening Supabase support recommended (mirrors relay#573 /
+    ROB-4012; see ROB-4017).
+    """
+
+    # No backoff (no wait): a reaped keep-alive socket just needs a fresh
+    # connection, not a delay (see the class docstring for why retrying is safe).
+    # The budget is a fixed constant, so the @retry decorator suffices.
+    @retry(
+        retry=retry_if_exception_type(httpx.RemoteProtocolError),
+        stop=stop_after_attempt(_DISCONNECT_RETRY_ATTEMPTS),
+        reraise=True,
+        before_sleep=_log_remote_protocol_retry,
+    )
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return super().handle_request(request)
+
+
+KEY_CACHE: TTLCache = TTLCache(maxsize=64, ttl=24 * 60 * 60)
+
+
+class SupabaseDal:
+    def __init__(self, cluster: str):
+        self.enabled = self.__init_config()
+        self.cluster = cluster
+        if not self.enabled:
+            logging.debug(
+                "Not connecting to Robusta platform - robusta token not provided - using ROBUSTA_AI will not be possible"
+            )
+            return
+        logging.info(
+            f"Initializing Robusta platform connection for account {self.account_id}"
+        )
+        # Build the client on SupabaseRetryTransport (HTTP/1.1 + RemoteProtocolError
+        # retry — see its docstring) and hand it to postgrest so postgrest doesn't
+        # build its own HTTP/2 client.
+        #
+        # Honor the environment's CA bundle (corporate / TLS-proxy CA in
+        # SSL_CERT_FILE / REQUESTS_CA_BUNDLE) the way supabase's default client does;
+        # our own client otherwise falls back to certifi and breaks TLS verification
+        # behind an intercepting proxy. Pass an SSLContext, not the path string
+        # (httpx deprecated `verify=<str>`), honoring a CA file or directory.
+        ca_bundle = os.environ.get("SSL_CERT_FILE") or os.environ.get(
+            "REQUESTS_CA_BUNDLE"
+        )
+        verify: "ssl.SSLContext | bool"
+        if not ca_bundle:
+            verify = True
+        elif os.path.isdir(ca_bundle):
+            verify = ssl.create_default_context(capath=ca_bundle)
+        else:
+            verify = ssl.create_default_context(cafile=ca_bundle)
+        # verify/http2 go on the transport (httpx ignores them on the client once a
+        # custom transport is supplied); timeout/follow_redirects stay on the client
+        # (supabase ignores postgrest_client_timeout once an httpx_client is given).
+        # httpx skips env proxies when given a custom transport; resolve it here
+        # so proxied clusters still reach Supabase.
+        parsed = urlparse(self.url)
+        proxy = None
+        if parsed.hostname:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if not proxy_bypass(f"{parsed.hostname}:{port}"):
+                proxy = getproxies().get(parsed.scheme)
+        transport = SupabaseRetryTransport(http2=False, verify=verify, proxy=proxy)
+        httpx_client = httpx.Client(
+            transport=transport,
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        )
+        options = ClientOptions(
+            postgrest_client_timeout=SUPABASE_TIMEOUT_SECONDS,
+            httpx_client=httpx_client,
+        )
+        sentry_sdk.set_tag("db_url", self.url)
+        self.__connect(options)
+        ttl = int(os.environ.get("SAAS_SESSION_TOKEN_TTL_SEC", "82800"))  # 23 hours
+        self.patch_postgrest_execute()
+        self.token_cache = TTLCache(maxsize=1, ttl=ttl)
+        # Read on every chat request but per-account and rarely changed, so cache it briefly
+        # instead of adding an AccountSettings round trip per turn. Parsed defensively: this
+        # runs in __init__, so a bad env var must not stop Holmes from starting.
+        raw_ttl = os.environ.get("SKILL_HIERARCHY_CACHE_TTL_SEC", "60")
+        try:
+            hierarchy_ttl = int(raw_ttl)
+            if hierarchy_ttl <= 0:
+                raise ValueError(f"must be positive, got {hierarchy_ttl}")
+        except ValueError as e:
+            logging.warning(
+                "Invalid SKILL_HIERARCHY_CACHE_TTL_SEC=%r (%s); falling back to 60s",
+                raw_ttl,
+                e,
+            )
+            hierarchy_ttl = 60
+        self.skill_hierarchy_cache = TTLCache(maxsize=1, ttl=hierarchy_ttl)
+        self.lock = threading.Lock()
+
+    def __connect(self, options: ClientOptions):
+        self.options = options
+        cache_key = f"{self.account_id}:{self.cluster}"
+        sources = (
+            lambda: KEY_CACHE.pop(cache_key, None),
+            lambda: fetch_supabase_api_key(self.account_id, self.cluster),
+        )
+        for source in sources:
+            key = source()
+            if not key:
+                continue
+            try:
+                self.__login(key, options)
+                KEY_CACHE[cache_key] = key
+                return
+            except Exception as e:
+                logging.warning(f"Supabase login with the relay api key failed: {e}")
+        self.__login(self.api_key, options)
+
+    def __login(self, api_key: str, options: ClientOptions):
+        self.client = create_client(self.url, api_key, options)  # type: ignore
+        self.user_id = self.sign_in()
+
+    def patch_postgrest_execute(self):
+        logging.info("Patching postgres execute")
+
+        # This is somewhat hacky.
+        def execute_with_retry(_self):
+            try:
+                return self._original_execute(_self)
+            except PGAPIError as exc:
+                message = exc.message or ""
+                if exc.code == "PGRST301" or "expired" in message.lower():
+                    # JWT expired. Sign in again and retry the query
+                    logging.error(
+                        "JWT token expired/invalid, signing in to Supabase again"
+                    )
+                    self.__connect(self.options)
+                    # update the session to the new one, after re-sign in
+                    _self.session = self.client.postgrest.session
+                    return self._original_execute(_self)
+                else:
+                    raise
+
+        self._original_execute = SyncQueryRequestBuilder.execute
+        SyncQueryRequestBuilder.execute = execute_with_retry
+
+    @staticmethod
+    def __load_robusta_config() -> Optional[RobustaToken]:
+        config_file_path = ROBUSTA_CONFIG_PATH
+        env_ui_token = os.environ.get("ROBUSTA_UI_TOKEN")
+        if env_ui_token:
+            # token provided as env var
+            try:
+                decoded = base64.b64decode(env_ui_token)
+                return RobustaToken(**json.loads(decoded))
+            except binascii.Error:
+                raise Exception(
+                    "binascii.Error encountered. The Robusta UI token is not a valid base64."
+                )
+            except json.JSONDecodeError:
+                raise Exception(
+                    "json.JSONDecodeError encountered. The Robusta UI token could not be parsed as JSON after being base64 decoded."
+                )
+
+        if not os.path.exists(config_file_path):
+            logging.debug(f"No robusta config in {config_file_path}")
+            return None
+
+        logging.info(f"loading config {config_file_path}")
+        with open(config_file_path) as file:
+            yaml_content = yaml.safe_load(file)
+            config = RobustaConfig(**yaml_content)
+            for conf in config.sinks_config:
+                if "robusta_sink" in conf.keys():
+                    token = conf["robusta_sink"].get("token")
+                    if not token:
+                        raise Exception(
+                            "No robusta token provided to Holmes.\n"
+                            "Please set a valid Robusta UI token.\n "
+                            "See https://holmesgpt.dev/ai-providers/ for instructions."
+                        )
+                    env_replacement_token = get_env_replacement(token)
+                    if env_replacement_token:
+                        token = env_replacement_token
+
+                    if "{{" in token:
+                        raise ValueError(
+                            "The robusta token configured for Holmes appears to be a templating placeholder (e.g. `{ env.UI_SINK_TOKEN }`).\n "
+                            "Ensure your Helm chart or environment variables are set correctly.\n "
+                            "If you store the token in a secret, you must also pass "
+                            "the environment variable ROBUSTA_UI_TOKEN to Holmes.\n "
+                            "See https://holmesgpt.dev/data-sources/builtin-toolsets/robusta/ for instructions."
+                        )
+                    try:
+                        decoded = base64.b64decode(token)
+                        return RobustaToken(**json.loads(decoded))
+                    except binascii.Error:
+                        raise Exception(
+                            "binascii.Error encountered. The robusta token provided to Holmes is not a valid base64."
+                        )
+                    except json.JSONDecodeError:
+                        raise Exception(
+                            "json.JSONDecodeError encountered. The Robusta token provided to Holmes could not be parsed as JSON after being base64 decoded."
+                        )
+        return None
+
+    def __init_config(self) -> bool:
+        # trying to load the supabase connection parameters from the robusta token, if exists
+        # if not, using env variables as fallback
+        robusta_token = self.__load_robusta_config()
+        if robusta_token:
+            self.account_id = robusta_token.account_id
+            self.url = robusta_token.store_url
+            self.api_key = robusta_token.api_key
+            self.email = robusta_token.email
+            self.password = robusta_token.password
+        else:
+            self.account_id = ROBUSTA_ACCOUNT_ID
+            self.url = STORE_URL
+            self.api_key = STORE_API_KEY
+            self.email = STORE_EMAIL
+            self.password = STORE_PASSWORD
+
+        # valid only if all store parameters are provided
+        return all([self.account_id, self.url, self.api_key, self.email, self.password])
+
+    def sign_in(self) -> str:
+        logging.info("Supabase dal login")
+        try:
+            res = self.client.auth.sign_in_with_password(
+                {"email": self.email, "password": self.password}
+            )
+            if not res.session:
+                raise ValueError("Authentication failed: no session returned")
+            if not res.user:
+                raise ValueError("Authentication failed: no user returned")
+            self.client.auth.set_session(
+                res.session.access_token, res.session.refresh_token
+            )
+            self.client.postgrest.auth(res.session.access_token)
+            return res.user.id
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(
+                dns_indicator in error_msg
+                for dns_indicator in [
+                    "temporary failure in name resolution",
+                    "name resolution",
+                    "dns",
+                    "name or service not known",
+                    "nodename nor servname provided",
+                ]
+            ):
+                raise SupabaseDnsException(e, self.url) from e
+            if isinstance(e, (ConnectionError, TimeoutError)) or any(
+                conn_indicator in error_msg
+                for conn_indicator in [
+                    "connection reset by peer",
+                    "connection reset",
+                    "connection refused",
+                    "connection aborted",
+                    "connection timed out",
+                    "network is unreachable",
+                    "no route to host",
+                    "errno 104",  # ECONNRESET
+                    "errno 111",  # ECONNREFUSED
+                ]
+            ):
+                # The platform resolved but refused/reset the connection - almost
+                # always an outbound firewall. Log the full actionable guidance at
+                # WARNING (not ERROR, so it doesn't raise a Sentry alert) before
+                # raising; the exception below stays a thin technical wrapper.
+                logging.warning(
+                    "Could not connect to the Robusta platform at %s. This is "
+                    "usually an outbound firewall blocking egress to the platform - "
+                    "allowlist outbound HTTPS to '*.robusta.dev'. See %s for "
+                    "troubleshooting steps.",
+                    self.url,
+                    FIREWALL_TROUBLESHOOTING_URL,
+                )
+                raise SupabaseConnectionException(e, self.url) from e
+            raise
+
+    def unzip_evidence_file(self, data):
+        try:
+            evidence_list = json.loads(data.get("data", "[]"))
+            if not evidence_list:
+                return data
+
+            evidence = evidence_list[0]
+            raw_data = evidence.get("data")
+
+            if evidence.get("type") != "gz" or not raw_data:
+                return data
+
+            # Strip "b'...'" or 'b"..."' markers if present
+            if raw_data.startswith("b'") and raw_data.endswith("'"):
+                raw_data = raw_data[2:-1]
+            elif raw_data.startswith('b"') and raw_data.endswith('"'):
+                raw_data = raw_data[2:-1]
+
+            gz_bytes = base64.b64decode(raw_data)
+            decompressed = gzip.decompress(gz_bytes).decode("utf-8")
+
+            evidence["data"] = decompressed
+            data["data"] = json.dumps([evidence])
+            return data
+
+        except Exception:
+            logging.exception(f"Unknown issue unzipping gz finding: {data}")
+            return data
+
+    def extract_relevant_issues(self, evidence):
+        data = [
+            enrich
+            for enrich in evidence.data
+            if enrich.get("enrichment_type") not in ENRICHMENT_BLACKLIST_SET
+        ]
+
+        unzipped_files = [
+            self.unzip_evidence_file(enrich)
+            for enrich in evidence.data
+            if enrich.get("enrichment_type") == "text_file"
+            or enrich.get("enrichment_type") == "alert_raw_data"
+        ]
+
+        data.extend(unzipped_files)
+        return data
+
+    def get_issue_from_db(self, issue_id: str, table: str) -> Optional[Dict]:
+        issue_response = (
+            self.client.table(table).select("*").filter("id", "eq", issue_id).execute()
+        )
+        if len(issue_response.data):
+            return issue_response.data[0]
+        return None
+
+    def get_issue_data(self, issue_id: Optional[str]) -> Optional[Dict]:
+        # TODO this could be done in a single atomic SELECT, but there is no
+        # foreign key relation between Issues and Evidence.
+        if not issue_id:
+            return None
+        if not self.enabled:  # store not initialized
+            return None
+        issue_data = None
+        try:
+            issue_data = self.get_issue_from_db(issue_id, ISSUES_TABLE)
+            if issue_data and issue_data["source"] == "prometheus":
+                logging.debug("Getting alert %s from GroupedIssuesTable", issue_id)
+                # This issue will have the complete alert duration information
+                issue_data = self.get_issue_from_db(issue_id, GROUPED_ISSUES_TABLE)
+
+        except Exception:  # e.g. invalid id format
+            logging.exception("Supabase error while retrieving issue data")
+            return None
+        if not issue_data:
+            return None
+        evidence = (
+            self.client.table(EVIDENCE_TABLE)
+            .select("*")
+            .eq("issue_id", issue_id)
+            .not_.in_("enrichment_type", ENRICHMENT_BLACKLIST)
+            .execute()
+        )
+        relevant_evidence = self.extract_relevant_issues(evidence)
+        truncate_evidences_entities_if_necessary(relevant_evidence)
+
+        issue_data["evidence"] = relevant_evidence
+
+        # Surface a uniform "firing" boolean so the LLM doesn't have to infer the
+        # alert's current state from raw timestamps. For prometheus alerts the
+        # GroupedIssues row fetched above already carries an explicit `firing`
+        # column; for every other source the firing state is implicit in
+        # `ends_at` (a null ends_at means the issue is still firing). Compute it
+        # from `ends_at` when it isn't already present so callers see the same
+        # field regardless of source.
+        if issue_data.get("firing") is None:
+            issue_data["firing"] = issue_data.get("ends_at") is None
+
+        # build issue investigation dates
+        started_at = issue_data.get("starts_at")
+        if started_at:
+            dt = datetime.fromisoformat(started_at)
+
+            # Calculate timestamps
+            start_timestamp = dt - timedelta(minutes=10)
+            end_timestamp = dt + timedelta(minutes=10)
+
+            issue_data["start_timestamp"] = start_timestamp.strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+            issue_data["end_timestamp"] = end_timestamp.strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+            issue_data["start_timestamp_millis"] = int(
+                start_timestamp.timestamp() * 1000
+            )
+            issue_data["end_timestamp_millis"] = int(end_timestamp.timestamp() * 1000)
+
+        return issue_data
+
+    def get_skill_catalog(self) -> Optional[List[RobustaSkillInstruction]]:
+        if not self.enabled:
+            return None
+
+        try:
+            res = (
+                self.client.table(RUNBOOKS_TABLE)
+                .select("*")
+                .eq("account_id", self.account_id)
+                .eq("subject_type", "RunbookCatalog")
+                .eq("enabled", True)
+                .execute()
+            )
+            if not res.data:
+                return None
+
+            instructions = []
+            for row in res.data:
+                id = row.get("runbook_id")
+                symptom = row.get("symptoms")
+                title = row.get("subject_name")
+                clusters = row.get("clusters")
+                alerts = row.get("alerts") or []
+                # Alerts are a valid alternative to symptoms (the UI enforces "either"), so
+                # requiring symptoms here discarded every alert-only skill.
+                if not symptom and not alerts:
+                    logging.warning(
+                        "Skipping skill with neither symptom nor alerts: %s", id
+                    )
+                    continue
+                # Filter by cluster: null means all clusters, otherwise check membership
+                if clusters is not None and self.cluster not in clusters:
+                    continue
+                # Per row, so one malformed row costs that skill rather than the whole
+                # catalog. ValidationError only -- a broader catch would hide real bugs.
+                try:
+                    instructions.append(
+                        RobustaSkillInstruction(
+                            id=id, symptom=symptom or "", title=title, alerts=alerts
+                        )
+                    )
+                except ValidationError:
+                    logging.warning(
+                        "Skipping malformed skill row: runbook_id=%s", id
+                    )
+            return instructions
+        except Exception:
+            logging.exception("Failed to fetch skill catalog", exc_info=True)
+            return None
+
+    def get_skill_content(self, skill_id: str) -> Optional[RobustaSkillInstruction]:
+        if not self.enabled:
+            return None
+
+        res = (
+            self.client.table(RUNBOOKS_TABLE)
+            .select("*")
+            .eq("account_id", self.account_id)
+            .eq("subject_type", "RunbookCatalog")
+            .eq("runbook_id", skill_id)
+            # Both catalog reads already skip disabled skills, so one was never offered to
+            # the model -- but its body stayed fetchable by id. NULL counts as disabled,
+            # matching what both catalogs do today.
+            .eq("enabled", True)
+            .execute()
+        )
+        if not res.data or len(res.data) != 1:
+            return None
+
+        row = res.data[0]
+        return RobustaSkillInstruction(
+            id=row.get("runbook_id"),
+            # `or ""` -- an alert-only skill has NULL symptoms, and `symptom` is typed `str`,
+            # so its "" default applies only when OMITTED; an explicit None fails validation
+            # and the skill becomes unfetchable despite being offered to the LLM.
+            symptom=row.get("symptoms") or "",
+            instruction=self._extract_skill_instruction(row, skill_id),
+            title=row.get("subject_name"),
+        )
+
+    @staticmethod
+    def _extract_skill_instruction(row: dict, skill_id: str) -> str:
+        """Normalize the runbook.instructions jsonb into a single string.
+
+        Returns "" when there is nothing to extract, NOT str(None). Callers fall back with
+        `instruction or pretty()`, and "None" is truthy -- it would suppress the fallback and
+        hand the LLM the literal text "None" as the skill body.
+        """
+        runbook = row.get("runbook")
+        if runbook is not None and not isinstance(runbook, dict):
+            # jsonb has no shape constraint, so this can be a list or scalar. `.get` on those
+            # raises, and the caller turns any exception into a silently dropped skill.
+            logging.error(
+                "Unexpected runbook shape for skill_id=%s: %s",
+                skill_id,
+                type(runbook).__name__,
+            )
+            return ""
+        raw_instruction = (runbook or {}).get("instructions")
+        if raw_instruction is None:
+            return ""
+        # TODO: remove in the future when we migrate the table data
+        if isinstance(raw_instruction, list):
+            # An empty list must return "" for the same reason str(None) must not become
+            # "None": callers fall back with `instruction or pretty()`, and str([]) == "[]"
+            # is truthy, which would suppress the fallback and hand the LLM "[]" as a body.
+            if not raw_instruction:
+                return ""
+            # Elements must all be strings before either fast path. jsonb has no shape
+            # constraint, so a list of dicts is possible -- and it used to return the dict
+            # itself (breaking this function's `-> str` contract, then failing validation in
+            # RobustaSkillInstruction) or raise TypeError out of the join. Both left the
+            # skill unfetchable. Fall through to "" instead, so pretty() renders the row.
+            if all(isinstance(item, str) for item in raw_instruction):
+                if len(raw_instruction) == 1:
+                    return raw_instruction[0]
+                # not currently used, but will be used in the future
+                return "\n - ".join(raw_instruction)
+            logging.error(
+                "Unexpected skill instruction element types for skill_id=%s: %s",
+                skill_id,
+                sorted({type(item).__name__ for item in raw_instruction}),
+            )
+            return ""
+        elif isinstance(raw_instruction, str):
+            # not supported by the current UI, but will be supported in the future
+            return raw_instruction
+        # in case the format is unexpected, convert to string. Log the TYPE only -- personal
+        # skill bodies are private to their owner and must not be written to shared logs.
+        logging.error(
+            "Unexpected skill instruction format for skill_id=%s: %s",
+            skill_id,
+            type(raw_instruction).__name__,
+        )
+        return str(raw_instruction)
+
+    def get_personal_skill_catalog(
+        self, user_id: str
+    ) -> Optional[List[RobustaSkillInstruction]]:
+        """List the given END USER's personal skills.
+
+        A plain table select: the RLS SELECT policy lets a row through for its owner OR for
+        the account's API-role user, and Holmes signs in as an AccountUsers row with
+        role = 'API'. Same mechanism the Conversations policies use.
+
+        `user_id` MUST come from the request -- never self.user_id, which is Holmes's own
+        service identity and identical on every request.
+        """
+        if not self.enabled or not user_id:
+            return None
+
+        try:
+            res = (
+                self.client.table(RUNBOOKS_TABLE)
+                # Must name every column the loop below reads. `alerts` is load-bearing:
+                # without it the "neither symptom nor alerts" guard drops alert-only skills
+                # outright, and every surviving skill loads as "applies to all alerts".
+                .select("runbook_id, subject_name, symptoms, alerts, clusters, enabled")
+                .eq("account_id", self.account_id)
+                .eq("user_id", user_id)
+                .eq("subject_type", PERSONAL_RUNBOOK_CATALOG)
+                .execute()
+            )
+            if not res.data:
+                return None
+
+            instructions = []
+            for row in res.data:
+                id = row.get("runbook_id")
+                symptom = row.get("symptoms")
+                title = row.get("subject_name")
+                clusters = row.get("clusters")
+                alerts = row.get("alerts") or []
+                if not row.get("enabled", True):
+                    continue
+                # See get_skill_catalog: alerts are a valid alternative to symptoms.
+                if not symptom and not alerts:
+                    logging.warning(
+                        "Skipping personal skill with neither symptom nor alerts: %s", id
+                    )
+                    continue
+                # Cluster filter (null = all). Must precede hierarchy dedup, so a skill
+                # scoped to another cluster cannot suppress an applicable one.
+                if clusters is not None and self.cluster not in clusters:
+                    continue
+                # Validate per row. id and title are required on the model, so a row with a
+                # null runbook_id or subject_name raises -- and if that reached the outer
+                # handler the user would silently lose EVERY personal skill, not just the
+                # malformed one. Skip the bad row instead.
+                try:
+                    instructions.append(
+                        RobustaSkillInstruction(
+                            id=id, symptom=symptom or "", title=title, alerts=alerts
+                        )
+                    )
+                # See get_skill_catalog: only ValidationError, so a real bug in this loop
+                # surfaces instead of being logged as malformed data.
+                except ValidationError:
+                    logging.warning(
+                        "Skipping malformed personal skill row: runbook_id=%s", id
+                    )
+            return instructions
+        except Exception:
+            logging.exception("Failed to fetch personal skill catalog", exc_info=True)
+            return None
+
+    def get_personal_skill_content(
+        self, skill_id: str, user_id: str
+    ) -> Optional[RobustaSkillInstruction]:
+        """Fetch one personal skill's body for the given END USER.
+
+        Scoped by user_id so one user cannot fetch another user's personal skill content --
+        the RLS policy admits Holmes for every personal row in the account, so this filter is
+        what keeps one user's fetch from reaching another's skill.
+        """
+        if not self.enabled or not user_id:
+            return None
+
+        try:
+            res = (
+                self.client.table(RUNBOOKS_TABLE)
+                .select("runbook_id, subject_name, symptoms, runbook, enabled")
+                .eq("account_id", self.account_id)
+                .eq("user_id", user_id)
+                .eq("runbook_id", skill_id)
+                .eq("subject_type", PERSONAL_RUNBOOK_CATALOG)
+                # See get_skill_content: a disabled skill must not be fetchable by id.
+                .eq("enabled", True)
+                .execute()
+            )
+            if not res.data:
+                return None
+
+            row = res.data[0] if isinstance(res.data, list) else res.data
+            return RobustaSkillInstruction(
+                id=row.get("runbook_id"),
+                # See get_skill_content: an alert-only skill has NULL symptoms and an
+                # explicit None fails validation. Here the ValidationError would be
+                # swallowed by the handler below and the caller would read the result as
+                # "not one of this user's skills", falling through to the global lookup.
+                symptom=row.get("symptoms") or "",
+                instruction=self._extract_skill_instruction(row, skill_id),
+                title=row.get("subject_name"),
+            )
+        except Exception:
+            logging.exception(
+                f"Failed to fetch personal skill content for skill_id={skill_id}",
+                exc_info=True,
+            )
+            return None
+
+    def get_skill_hierarchy_config(self) -> SkillHierarchyConfig:
+        """Read the per-account skill name-collision policy from AccountSettings.
+
+        Defaults to disabled, which preserves today's behaviour (no cross-tier dedup).
+        Any read failure also falls back to the default rather than changing behaviour.
+        """
+        default = SkillHierarchyConfig()
+        if not self.enabled:
+            return default
+
+        cached = self.skill_hierarchy_cache.get("config")
+        if cached is not None:
+            return cached
+
+        try:
+            res = (
+                self.client.table(ACCOUNT_SETTINGS_TABLE)
+                .select("settings")
+                .eq("account_id", self.account_id)
+                .execute()
+            )
+            if not res.data:
+                self.skill_hierarchy_cache["config"] = default
+                return default
+
+            settings = res.data[0].get("settings") or {}
+            raw_enabled = settings.get("skill_name_hierarchy_enabled", False)
+            if isinstance(raw_enabled, bool):
+                enabled = raw_enabled
+            else:
+                # Written by hand-run SQL, so the string "false" is a realistic mistake --
+                # and bool("false") is True, which would silently enable suppression.
+                logging.warning(
+                    "Ignoring non-boolean skill_name_hierarchy_enabled=%r; treating as false",
+                    raw_enabled,
+                )
+                enabled = False
+            order = settings.get("skill_name_hierarchy_order") or DEFAULT_HIERARCHY_ORDER
+            if not isinstance(order, list) or not all(
+                isinstance(tier, str) for tier in order
+            ):
+                logging.warning(
+                    f"Ignoring malformed skill_name_hierarchy_order: {order!r}"
+                )
+                order = DEFAULT_HIERARCHY_ORDER
+            config = SkillHierarchyConfig(enabled=enabled, order=order)
+            self.skill_hierarchy_cache["config"] = config
+            return config
+        except Exception:
+            logging.exception(
+                "Failed to fetch skill hierarchy config; falling back to disabled",
+                exc_info=True,
+            )
+            # Cache the fallback too, so a persistent read failure does not retry Supabase
+            # on every single chat request.
+            self.skill_hierarchy_cache["config"] = default
+            return default
+
+    def get_resource_instructions(
+        self, type: str, name: Optional[str]
+    ) -> Optional[ResourceInstructions]:
+        if not self.enabled or not name:
+            return None
+
+        res = (
+            self.client.table(RUNBOOKS_TABLE)
+            .select("runbook")
+            .eq("account_id", self.account_id)
+            .eq("subject_type", type)
+            .eq("subject_name", name)
+            .execute()
+        )
+        if res.data:
+            instructions = res.data[0].get("runbook").get("instructions")
+            documents_data = res.data[0].get("runbook").get("documents")
+            documents = []
+
+            if documents_data:
+                for document_data in documents_data:
+                    url = document_data.get("url", None)
+                    if url:
+                        documents.append(ResourceInstructionDocument(url=url))
+                    else:
+                        logging.warning(
+                            f"Unsupported runbook for subject_type={type} / subject_name={name}: {document_data}"
+                        )
+
+            return ResourceInstructions(instructions=instructions, documents=documents)
+
+        return None
+
+    def get_global_instructions_for_account(self) -> Optional[Instructions]:
+        if not self.enabled:
+            return None
+
+        try:
+            res = (
+                self.client.table(RUNBOOKS_TABLE)
+                .select("runbook")
+                .eq("account_id", self.account_id)
+                .eq("subject_type", "Account")
+                .execute()
+            )
+
+            if res.data:
+                instructions = res.data[0].get("runbook").get("instructions")
+                return Instructions(instructions=instructions)
+        except Exception:
+            logging.exception("Failed to fetch global instructions", exc_info=True)
+
+        return None
+
+    def create_session_token(self) -> str:
+        token = str(uuid4())
+        self.client.table(SESSION_TOKENS_TABLE).insert(
+            {
+                "account_id": self.account_id,
+                "user_id": self.user_id,
+                "token": token,
+                "type": "HOLMES",
+            },
+            returning=ReturnMethod.minimal,  # must use this, because the user cannot read this table
+        ).execute()
+        return token
+
+    def get_ai_credentials(self) -> Tuple[str, str]:
+        if not self.enabled:
+            raise Exception(
+                "You're trying to use ROBUSTA_AI, but Cannot get credentials for ROBUSTA_AI. Store not initialized."
+            )
+
+        with self.lock:
+            session_token = self.token_cache.get("session_token")
+            if not session_token:
+                session_token = self.create_session_token()
+                self.token_cache["session_token"] = session_token
+
+        return self.account_id, session_token
+
+    def upsert_holmes_status(self, holmes_status_data: dict) -> None:
+        if not self.enabled:
+            logging.info(
+                "Robusta store not initialized. Skipping upserting holmes status."
+            )
+            return
+
+        updated_at = datetime.now().isoformat()
+        try:
+            (
+                self.client.table(HOLMES_STATUS_TABLE)
+                .upsert(
+                    {
+                        "account_id": self.account_id,
+                        "updated_at": updated_at,
+                        **holmes_status_data,
+                    },
+                    on_conflict="account_id, cluster_id",
+                )
+                .execute()
+            )
+        except Exception as error:
+            logging.error(
+                f"Error happened during upserting holmes status: {error}", exc_info=True
+            )
+
+        return None
+
+    def sync_toolsets(self, toolsets: list[dict], cluster_name: str) -> None:
+        if not toolsets:
+            logging.warning("No toolsets were provided for synchronization.")
+            return
+
+        if not self.enabled:
+            logging.info(
+                "Robusta store not initialized. Skipping sync holmes toolsets."
+            )
+            return
+
+        provided_toolset_names = [toolset["toolset_name"] for toolset in toolsets]
+
+        try:
+            self.client.table(HOLMES_TOOLSET).upsert(
+                toolsets, on_conflict="account_id, cluster_id, toolset_name"
+            ).execute()
+
+            logging.info("Toolsets upserted successfully.")
+
+            self.client.table(HOLMES_TOOLSET).delete().eq(
+                "account_id", self.account_id
+            ).eq("cluster_id", cluster_name).not_.in_(
+                "toolset_name", provided_toolset_names
+            ).execute()
+
+            logging.info("Toolsets synchronized successfully.")
+
+        except Exception as e:
+            logging.exception(
+                f"An error occurred during toolset synchronization: {e}", exc_info=True
+            )
+
+    def sync_skills(
+        self, skills: list[dict], cluster_name: str, prune: bool
+    ) -> None:
+        """Mirror this cluster's filesystem + builtin skills into HolmesCustomSkills.
+
+        The filesystem stays the source of truth -- Holmes keeps executing these from disk.
+        These rows exist only so the UI can display them, so this is a plain upsert plus a
+        prune of names that no longer exist for this (account, cluster). Best-effort: a
+        failure here must never break startup.
+
+        `prune` is required rather than defaulted because it gates a DELETE, so the caller
+        has to state whether the loaded set is authoritative. Pass the loader's
+        FilesystemSkills.sources_ok: True only when every skill source was readable.
+
+        The four cases:
+          prune=True,  skills non-empty -> upsert, then delete every other name
+          prune=True,  skills empty     -> delete every row for this cluster (the user really
+                                           did delete their last skill)
+          prune=False, skills non-empty -> upsert only; a partially-readable load must not
+                                           prune the part that failed to load
+          prune=False, skills empty     -> no-op; nothing was read, so nothing is known
+        """
+        if not self.enabled:
+            logging.info("Robusta store not initialized. Skipping sync holmes skills.")
+            return
+
+        if not skills and not prune:
+            logging.debug(
+                "No skills loaded and sources were not fully readable; skipping sync."
+            )
+            return
+
+        provided_skill_names = [skill["skill_name"] for skill in skills]
+
+        try:
+            if skills:
+                self.client.table(HOLMES_CUSTOM_SKILLS_TABLE).upsert(
+                    skills, on_conflict="account_id, cluster_id, skill_name"
+                ).execute()
+
+            if not prune:
+                logging.info(
+                    f"Upserted {len(skills)} custom skills; skipped pruning because at "
+                    "least one skill source could not be read."
+                )
+                return
+
+            stale = (
+                self.client.table(HOLMES_CUSTOM_SKILLS_TABLE)
+                .delete()
+                .eq("account_id", self.account_id)
+                .eq("cluster_id", cluster_name)
+            )
+            # Only add the not-in filter when there is something to exclude. An empty list
+            # renders as `skill_name=not.in.()`, which PostgREST does not reliably accept --
+            # and semantically the empty case wants an unfiltered delete anyway.
+            if provided_skill_names:
+                stale = stale.not_.in_("skill_name", provided_skill_names)
+            stale.execute()
+
+            logging.info(f"Synchronized {len(skills)} custom skills successfully.")
+        except Exception as e:
+            logging.exception(
+                f"An error occurred during skill synchronization: {e}", exc_info=True
+            )
+
+    def record_usage_event(self, state: "UsageRecorderState") -> None:
+        """Record one HolmesUsageEvents row. Best-effort: swallows DB errors.
+
+        Called from UsageRecorderState._fire on a daemon thread, so
+        errors here only affect the telemetry row, never the request
+        response. Takes a ``UsageRecorderState`` and reads only the fields
+        that map to columns — this is the single place that knows the
+        column shape, so adding a new field is "add it on the state, read
+        it here, write the migration." The DAL doesn't import the state
+        class at runtime (TYPE_CHECKING-only); attribute access is duck-
+        typed, so any object with the right shape works (handy for tests).
+        """
+        if not self.enabled:
+            return
+        try:
+            stats = state.stats  # may be None on aborted/error rows
+            self.client.table(HOLMES_USAGE_EVENTS_TABLE).insert({
+                "account_id": self.account_id,
+                "cluster_id": state.cluster_id or self.cluster,
+                "user_id": state.user_id,
+                "user_email": state.user_email,
+                "conversation_id": state.conversation_id,
+                "conversation_source": state.conversation_source,
+                "request_id": state.request_id,
+                "request_type": state.request_type,
+                "request_source": state.request_source,
+                "source_ref": state.source_ref,
+                "status": state.status,
+                "model": state.model,
+                "provider": state.provider,
+                "is_robusta_model": state.is_robusta_model,
+                # Stats may be None when the request never reached a terminal
+                # event with cost data (aborted / pre-LLM error). The getattr
+                # default keeps the row writable in those cases.
+                "prompt_tokens": getattr(stats, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(stats, "completion_tokens", 0) or 0,
+                "cached_tokens": getattr(stats, "cached_tokens", None),
+                "reasoning_tokens": getattr(stats, "reasoning_tokens", 0) or 0,
+                "total_tokens": getattr(stats, "total_tokens", 0) or 0,
+                "total_cost": float(getattr(stats, "total_cost", 0.0) or 0.0),
+                "num_compactions": getattr(stats, "num_compactions", 0) or 0,
+                "iterations": state.iterations,
+                "max_prompt_tokens_per_call": getattr(
+                    stats, "max_prompt_tokens_per_call", 0
+                ) or 0,
+                "max_completion_tokens_per_call": getattr(
+                    stats, "max_completion_tokens_per_call", 0
+                ) or 0,
+                "tool_call_count": state.tool_call_count,
+                "duration_ms": state.duration_ms,
+                "is_streaming": state.is_streaming,
+                "is_internal": state.is_internal,
+                "finish_reason": state.finish_reason,
+                "meta": state.meta or {},
+            }).execute()
+        except Exception:
+            logging.exception("Failed to record usage event")
+
+    # NOTE: feedback writes (thumbs up/down + category + comment) do NOT go
+    # through Holmes. The frontend calls the public.record_feedback() Postgres
+    # function directly via supabase.rpc('record_feedback', ...). The function
+    # runs `security invoker` and scopes by `auth.uid()`, which is a stricter
+    # user-scoping than any FE-supplied user_id we could pass through here.
+    # See plan section G and the migration script for the function body.
+
+    def has_scheduled_prompt_definitions(self) -> bool:
+        """
+        Check if the account has any scheduled prompt definitions.
+        Returns True if count > 0, False otherwise.
+        """
+        if not self.enabled:
+            return False
+
+        try:
+            res = (
+                self.client.table("ScheduledPromptsDefinitions")
+                .select("id", count="exact")
+                .eq("account_id", self.account_id)
+                .limit(1)
+                .execute()
+            )
+
+            count = res.count if hasattr(res, "count") else 0
+            return count > 0
+        except Exception:
+            logging.exception(
+                "Supabase error while checking scheduled prompt definitions",
+                exc_info=True,
+            )
+            return False
+
+    def claim_scheduled_prompt_run(self, holmes_id: str) -> Optional[Dict]:
+        if not self.enabled:
+            return None
+
+        try:
+            res = self.client.rpc(
+                "claim_scheduled_prompt_run",
+                {
+                    "_account_id": self.account_id,
+                    "_cluster_name": self.cluster,
+                    "_holmes_id": holmes_id,
+                },
+            ).execute()
+
+            if not res.data:
+                return None
+
+            row = res.data[0] if isinstance(res.data, list) else res.data
+            # supabase returns empty row if no data found
+            if not row.get("id"):
+                return None
+
+            return row
+        except Exception:
+            logging.exception(
+                "Supabase error while claiming scheduled prompt run",
+                exc_info=True,
+            )
+            return None
+
+    def update_run_status(
+        self, run_id: str, status: RunStatus, msg: Optional[str] = None
+    ) -> bool:
+        if not self.enabled:
+            logging.info(
+                "Robusta store not initialized. Skipping updating scheduled prompt run status."
+            )
+            return False
+
+        status_str = status.value
+
+        try:
+            update_data = {
+                "status": status_str,
+                "last_heartbeat_at": datetime.now().isoformat(),
+            }
+            if msg is not None:
+                update_data["msg"] = msg
+
+            (
+                self.client.table(SCHEDULED_PROMPTS_RUNS_TABLE)
+                .update(update_data)
+                .eq("id", run_id)
+                .eq("account_id", self.account_id)
+                .execute()
+            )
+
+            logging.debug(f"Updated run {run_id} status to {status}")
+            return True
+        except Exception as e:
+            logging.exception(
+                f"Error updating scheduled prompt run status: {e}", exc_info=True
+            )
+            return False
+
+    # ---- M2: Conversations worker DAL methods ----
+
+    def is_realtime_enabled(self) -> Optional[bool]:
+        """
+        Check whether Supabase Realtime is enabled by calling the
+        ``public.is_realtime_enabled()`` RPC.
+
+        Returns:
+            ``True``  — RPC executed and reported realtime is enabled.
+            ``False`` — RPC executed and reported realtime is NOT enabled,
+                       OR the RPC does not exist (treated as not enabled).
+            ``None``  — Could not determine (connectivity error, auth failure,
+                       or any other transport-level issue). The caller should
+                       NOT take destructive action in this case.
+
+        We deliberately distinguish "definitive answer from server" from
+        "couldn't reach the server" so the conversation worker only disables
+        itself when Supabase has actually told us realtime is off.
+        """
+        if not self.enabled:
+            return None
+
+        try:
+            res = self.client.rpc("is_realtime_enabled", {}).execute()
+        except PGAPIError as exc:
+            # PostgREST returns PGRST202 ("Could not find the function ...")
+            # when the RPC does not exist. Treat that as a definitive "no".
+            code = getattr(exc, "code", None) or ""
+            message = (getattr(exc, "message", None) or "").lower()
+            if code == "PGRST202" or "could not find the function" in message:
+                logging.info(
+                    "is_realtime_enabled RPC does not exist — treating Supabase "
+                    "Realtime as disabled"
+                )
+                return False
+            logging.warning(
+                "Supabase API error while checking realtime status (code=%s): %s",
+                code,
+                exc,
+            )
+            return None
+        except Exception:
+            logging.warning(
+                "Connectivity/transport error while checking realtime status",
+                exc_info=True,
+            )
+            return None
+
+        data = res.data
+        if isinstance(data, list):
+            # An empty list means PostgREST returned no rows — there's no
+            # value to coerce, so we can't conclude anything. Treat it as
+            # inconclusive (None) rather than silently disabling the
+            # worker on a False fallback.
+            if not data:
+                logging.warning(
+                    "is_realtime_enabled returned an empty result set — "
+                    "treating as inconclusive"
+                )
+                return None
+            data = data[0]
+        if data is None:
+            return None
+        # PostgREST normally returns the scalar boolean directly, but a
+        # SQL function tweak could yield a row dict like {"enabled": ...}.
+        # Bail to inconclusive on anything else — naive bool() coercion
+        # would misclassify a non-empty dict as True.
+        if isinstance(data, bool):
+            return data
+        if isinstance(data, dict) and "enabled" in data:
+            return bool(data["enabled"])
+        logging.warning(
+            "is_realtime_enabled returned unexpected payload type %s — "
+            "treating as inconclusive",
+            type(data).__name__,
+        )
+        return None
+
+    def claim_n_pending_conversations(
+        self, holmes_id: str, limit: int
+    ) -> List[Dict]:
+        """
+        Claim up to ``limit`` pending conversations (oldest first), landing them
+        directly in 'running' ('queued' is deprecated). ``limit`` <= 0 claims
+        nothing. Returns the claimed rows (assignee=holmes_id).
+        """
+        if not self.enabled:
+            return []
+        if limit <= 0:
+            return []
+
+        # Retry transient infra errors (DNS/5xx) so a hiccup doesn't skip a poll.
+        @retry(
+            retry=retry_if_exception_type(Exception),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
+            reraise=True,
+        )
+        def _claim_with_retry() -> List[Dict]:
+            res = self.client.rpc(
+                "claim_n_pending_conversations",
+                {
+                    "_account_id": self.account_id,
+                    "_cluster_id": self.cluster,
+                    "_assignee": holmes_id,
+                    "_limit": limit,
+                },
+            ).execute()
+            if not res.data:
+                return []
+            if isinstance(res.data, list):
+                return res.data
+            return [res.data]
+
+        try:
+            return _claim_with_retry()
+        except Exception:
+            logging.exception(
+                "Supabase error while claiming conversations (after retries)",
+                exc_info=True,
+            )
+            return []
+
+    def claim_n_pending_tool_calls(self, holmes_id: str, limit: int) -> List[Dict]:
+        """
+        Claim up to ``limit`` pending remote tool calls (oldest first), landing
+        them directly in 'running' ('queued' is deprecated). ``limit`` <= 0
+        claims nothing. Returns the claimed rows (assignee=holmes_id).
+        """
+        if not self.enabled:
+            return []
+        if limit <= 0:
+            return []
+
+        # Retry transient infra errors (DNS/5xx) so a hiccup doesn't skip a poll.
+        @retry(
+            retry=retry_if_exception_type(Exception),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
+            reraise=True,
+        )
+        def _claim_with_retry() -> List[Dict]:
+            res = self.client.rpc(
+                "claim_n_pending_tool_calls",
+                {
+                    "_account_id": self.account_id,
+                    "_cluster_id": self.cluster,
+                    "_assignee": holmes_id,
+                    "_limit": limit,
+                },
+            ).execute()
+            if not res.data:
+                return []
+            if isinstance(res.data, list):
+                return res.data
+            return [res.data]
+
+        try:
+            return _claim_with_retry()
+        except Exception:
+            logging.exception(
+                "Supabase error while claiming tool calls (after retries)",
+                exc_info=True,
+            )
+            return []
+
+    def post_remote_tool_call_result(
+        self,
+        tool_call_id: str,
+        assignee: str,
+        status: str,
+        tool_response: Dict,
+    ) -> bool:
+        """
+        Publish a remote tool call result: tool_response + terminal status
+        ('completed'/'failed') in one atomic, assignee-guarded UPDATE.
+        Returns False when the row was reassigned/stopped (stale worker) —
+        callers must log and drop, never retry.
+        """
+        if not self.enabled:
+            return False
+
+        # Retry transient infrastructure errors so a hiccup doesn't drop a
+        # finished tool result. MISMATCH / not-found mean the row was
+        # reassigned/stopped/already-finished — terminal, never retried.
+        @retry(
+            retry=retry_if_not_exception_type(_RemoteToolResultRejected),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
+            reraise=True,
+        )
+        def _post_with_retry() -> bool:
+            try:
+                res = self.client.rpc(
+                    "post_remote_tool_call_result",
+                    {
+                        "_id": tool_call_id,
+                        "_account_id": self.account_id,
+                        "_assignee": assignee,
+                        "_status": status,
+                        "_tool_response": tool_response,
+                    },
+                ).execute()
+                return bool(res.data)
+            except Exception as e:
+                msg = str(e).lower()
+                if "mismatch" in msg or "not found" in msg:
+                    raise _RemoteToolResultRejected(str(e)) from e
+                raise
+
+        try:
+            return _post_with_retry()
+        except _RemoteToolResultRejected as e:
+            # Stale/duplicate worker: log calmly and drop (first result wins).
+            logging.info(
+                "Remote tool call result rejected (stale/duplicate worker): %s", e
+            )
+            return False
+        except Exception:
+            logging.exception(
+                "Supabase error while posting remote tool call result (after retries)",
+                exc_info=True,
+            )
+            return False
+
+    def post_conversation_events(
+        self,
+        conversation_id: str,
+        assignee: str,
+        request_sequence: int,
+        events: list,
+        compact: bool = False,
+    ) -> Optional[int]:
+        """
+        Post a batch of events. Returns assigned seq number on success.
+        Raises an exception on errors including assignee / request_sequence mismatch.
+
+        When ``compact=True``, the ``post_conversation_events`` RPC marks all
+        previous events in the conversation with seq < new_seq as compacted=true
+        (global per conversation, not scoped to request_sequence).
+        """
+        # Lazy imports avoid a circular import: conversations_worker pulls in
+        # conversations.py → config → llm → supabase_dal at module load time.
+        from holmes.core.conversations_worker.models import (
+            ConversationReassignedError,
+        )
+
+        if not self.enabled:
+            return None
+
+        # Retry transient infrastructure errors so a hiccup doesn't drop a
+        # batch of events. MISMATCH means the row was reassigned — never
+        # retried, raised as ConversationReassignedError so the worker exits.
+        @retry(
+            retry=retry_if_not_exception_type(ConversationReassignedError),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
+            reraise=True,
+        )
+        def _post_with_retry() -> Optional[int]:
+            try:
+                res = self.client.rpc(
+                    "post_conversation_events",
+                    {
+                        "_account_id": self.account_id,
+                        "_conversation_id": conversation_id,
+                        "_assignee": assignee,
+                        "_request_sequence": request_sequence,
+                        "_events": events,
+                        "_compact": compact,
+                    },
+                ).execute()
+                if res.data is None:
+                    return None
+                if isinstance(res.data, list):
+                    if not res.data:
+                        return None
+                    return (
+                        int(res.data[0])
+                        if not isinstance(res.data[0], dict)
+                        else None
+                    )
+                return int(res.data)
+            except ConversationReassignedError:
+                raise
+            except Exception as e:
+                if "mismatch" in str(e).lower():
+                    raise ConversationReassignedError(str(e)) from e
+                raise
+
+        try:
+            return _post_with_retry()
+        except ConversationReassignedError:
+            raise
+        except Exception:
+            logging.exception(
+                "Supabase error while posting conversation events (after retries)",
+                exc_info=True,
+            )
+            raise
+
+    def update_conversation_status(
+        self,
+        conversation_id: str,
+        request_sequence: int,
+        assignee: str,
+        status: str,
+    ) -> bool:
+        """
+        Transition a conversation between active states or to terminal states.
+
+        Accepted statuses: ``queued``, ``running``, ``completed``, ``failed``.
+        The RPC validates that the current status is ``queued`` or ``running``
+        and that assignee + request_sequence match the row.  On terminal states
+        (``completed``, ``failed``) the assignee is cleared by the RPC.
+        """
+        # Lazy imports avoid a circular import: conversations_worker pulls in
+        # conversations.py → config → llm → supabase_dal at module load time.
+        from holmes.core.conversations_worker.models import (
+            ConversationReassignedError,
+            ConversationStatus,
+        )
+
+        if not self.enabled:
+            return False
+
+        if status not in ConversationStatus.updatable_values():
+            logging.error(
+                "update_conversation_status received invalid status %s", status
+            )
+            return False
+
+        # Retry transient infrastructure errors so a hiccup doesn't leave the
+        # conversation stuck in a non-terminal state. MISMATCH means the row
+        # was reassigned — never retried, raised as ConversationReassignedError.
+        @retry(
+            retry=retry_if_not_exception_type(ConversationReassignedError),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
+            reraise=True,
+        )
+        def _update_with_retry() -> bool:
+            try:
+                res = self.client.rpc(
+                    "update_conversation_status",
+                    {
+                        "_account_id": self.account_id,
+                        "_conversation_id": conversation_id,
+                        "_request_sequence": request_sequence,
+                        "_assignee": assignee,
+                        "_status": status,
+                    },
+                ).execute()
+                return bool(res.data)
+            except Exception as e:
+                if "mismatch" in str(e).lower():
+                    raise ConversationReassignedError(str(e)) from e
+                raise
+
+        try:
+            return _update_with_retry()
+        except ConversationReassignedError:
+            raise
+        except Exception:
+            logging.exception(
+                "Supabase error while updating conversation status (after retries)",
+                exc_info=True,
+            )
+            return False
+
+    def get_conversation_events(
+        self,
+        conversation_id: str,
+        include_compacted: bool = False,
+        min_seq: int = 1,
+    ) -> List[Dict]:
+        """
+        Fetch conversation events as a flat chronological list.
+
+        Calls the ``get_conversation_events`` RPC, which flattens all events
+        from all matching rows into a single array ordered by ``(seq, ord)``.
+        Each element is an event dict ``{"event": ..., "data": ..., "ts": ...}``.
+
+        When ``include_compacted=False`` (default), events from rows marked
+        ``compacted=true`` are excluded — those have been superseded by a later
+        ``conversation_history_compacted`` event whose ``messages`` array already
+        reflects the consolidated state.
+
+        Holmes does not have direct SELECT/UPDATE on ConversationEvents under
+        RLS — all reads go through this SECURITY DEFINER RPC.
+        """
+        if not self.enabled:
+            return []
+
+        # Retry transient infrastructure errors. The caller treats [] as "no
+        # user question" and fails the conversation, so a hiccup here would
+        # cause a spurious permanent failure.
+        @retry(
+            retry=retry_if_exception_type(Exception),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
+            reraise=True,
+        )
+        def _fetch_with_retry() -> List[Dict]:
+            res = self.client.rpc(
+                "get_conversation_events",
+                {
+                    "_account_id": self.account_id,
+                    "_conversation_id": conversation_id,
+                    "_include_compacted": include_compacted,
+                    "_min_seq": min_seq,
+                },
+            ).execute()
+            return res.data or []
+
+        try:
+            return _fetch_with_retry()
+        except Exception:
+            logging.exception(
+                "Supabase error while fetching conversation events (after retries)",
+                exc_info=True,
+            )
+            return []
+
+    def finish_scheduled_prompt_run(
+        self,
+        status: RunStatus,
+        result: Dict,
+        run_id: str,
+        scheduled_prompt_definition_id: Optional[str],
+        version: str,
+        metadata: Optional[dict],
+    ) -> bool:
+        if not self.enabled:
+            logging.info(
+                "Robusta store not initialized. Skipping finishing scheduled prompt run."
+            )
+            return False
+
+        if status not in (
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.FAILED_NO_RETRY,
+        ):
+            logging.error(
+                "finish_scheduled_prompt_run received invalid status %s", status
+            )
+            return False
+
+        try:
+            self.client.rpc(
+                "finish_scheduled_prompt_run",
+                {
+                    "_cluster_name": self.cluster,
+                    "_account_id": self.account_id,
+                    "_status": status.value,
+                    "_result": result,
+                    "_scheduled_prompt_run_id": run_id,
+                    "_scheduled_prompt_definition_id": scheduled_prompt_definition_id,
+                    "_version": version,
+                    "_metadata": metadata,
+                },
+            ).execute()
+            return True
+        except Exception:
+            logging.exception(
+                "Supabase error while finishing scheduled prompt run",
+                exc_info=True,
+            )
+            return False
+
+    # --- OAuth Token Storage ---
+
+    def get_oauth_token(
+        self, provider_name: str, user_id: str, signing_key_hash: str
+    ) -> Optional[Dict]:
+        """Get the OAuth token for a provider in this account, scoped to a user and signing key.
+
+        When user_id is None, returns None — in server mode every token is stored
+        with a real user_id, so there are no unscoped tokens to find.
+        """
+        if not self.enabled:
+            return None
+        if not user_id:
+            return None
+        try:
+            query = (
+                self.client.table(OAUTH_TOKENS_TABLE)
+                .select("*")
+                .eq("account_id", self.account_id)
+                .eq("provider_name", provider_name)
+                .eq("user_id", user_id)
+            )
+            res = query.order("updated_at", desc=True).execute()
+            if not res.data:
+                return None
+            matched = None
+            # this logic could be simplified if we queried by signing_key_hash but it is deliberate to notify users on signing_key mismatches
+            for row in res.data:
+                stored_hash = row.get("signing_key_hash")
+                if stored_hash == signing_key_hash:
+                    matched = row
+                else:
+                    if signing_key_hash:
+                        logging.warning(
+                            "DB token signing_key_hash mismatch (stored=%s, current=%s)",
+                            stored_hash[:12],
+                            signing_key_hash[:12],
+                        )
+            return matched
+        except Exception:
+            logging.exception(
+                "Error fetching OAuth token for provider %s", provider_name
+            )
+            return None
+
+    def upsert_oauth_token(
+        self,
+        provider_name: str,
+        encrypted_token: str,
+        signing_key_hash: str,
+        token_expiry: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> bool:
+        """Store or update an OAuth token for a provider in this account, scoped to a user."""
+        if not self.enabled:
+            return False
+        if not user_id:
+            logging.warning(
+                "Cannot upsert OAuth token without user_id (provider=%s)", provider_name
+            )
+            return False
+        try:
+            row = {
+                "account_id": self.account_id,
+                "origin_cluster_id": self.cluster or "unknown",
+                "provider_name": provider_name,
+                "encrypted_token": encrypted_token,
+                "signing_key_hash": signing_key_hash,
+                "token_expiry": token_expiry,
+                "updated_at": "now()",
+                "user_id": user_id,
+            }
+            self.client.table(OAUTH_TOKENS_TABLE).upsert(
+                row,
+                on_conflict="account_id,provider_name,signing_key_hash,user_id",
+            ).execute()
+            return True
+        except Exception:
+            logging.exception(
+                "Error upserting OAuth token for provider %s", provider_name
+            )
+            return False
+
+    def delete_oauth_token(
+        self, provider_name: str, user_id: str, signing_key_hash: str
+    ) -> None:
+        """Delete an OAuth token (e.g. after a 401 proves it's revoked)."""
+        self.client.table(OAUTH_TOKENS_TABLE).delete().eq(
+            "account_id", self.account_id
+        ).eq("provider_name", provider_name).eq("user_id", user_id).eq(
+            "signing_key_hash", signing_key_hash
+        ).execute()
+
+    def get_all_oauth_tokens_for_cluster(self, signing_key_hash: str) -> list[Dict]:
+        """Get all OAuth tokens owned by this cluster that match the signing key.
+
+        Preloads tokens into the in-memory cache at startup so the background
+        sweep thread can keep them alive (refresh before expiry). Without this,
+        tokens only enter the cache on first user request and may expire in the
+        DB if no requests arrive within the token lifetime.
+        """
+        if not self.enabled:
+            return []
+        try:
+            res = (
+                self.client.table(OAUTH_TOKENS_TABLE)
+                .select("*")
+                .eq("account_id", self.account_id)
+                .eq("origin_cluster_id", self.cluster or "unknown")
+                .eq("signing_key_hash", signing_key_hash)
+                .execute()
+            )
+            return res.data or []
+        except Exception:
+            logging.exception("Error fetching OAuth tokens for cluster preload")
+            return []
